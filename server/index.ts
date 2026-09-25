@@ -4,9 +4,11 @@ import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { clientMessageSchema, evalRequestSchema, type LabEvent, type ServerMessage } from '../shared/protocol';
+import { clientMessageSchema, evalRequestSchema, transportFor, type LabEvent, type OutputMode, type ServerMessage } from '../shared/protocol';
+import { decodePcm } from '../shared/audio';
 import { GuardrailEngine } from './engine';
 import { connectAzure, type AzureConnection } from './azure';
+import { connectGatedAzure, type GatedAzureConnection } from './azure-gated';
 import { createJudge } from './judges';
 import { env, publicRunConfig, readiness } from './config';
 import { evaluate, latestProviderReplay } from './evaluation';
@@ -60,7 +62,10 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', ws => {
   let engine: GuardrailEngine | undefined;
-  let azure: AzureConnection | undefined;
+  let azure: AzureConnection | GatedAzureConnection | undefined;
+  let outputMode: OutputMode = 'monitor';
+  let audioWindow = performance.now();
+  let audioBytes = 0;
   let ownsCall = false;
   let closed = false;
   let starting = false;
@@ -80,6 +85,9 @@ wss.on('connection', ws => {
     if (ownsCall) { liveBusy = false; ownsCall = false; }
   };
   const send = (message: ServerMessage) => {
+    if (message.type === 'audio-chunk' && ws.bufferedAmount > 4 * 1024 * 1024) {
+      send({ type: 'fatal', message: 'Local native audio relay is overloaded. Buffered speech discarded.' }); return;
+    }
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
     if (message.type === 'fatal') { cleanup(); ws.close(); }
   };
@@ -88,14 +96,13 @@ wss.on('connection', ws => {
     const logged = env.LOG_LIVE_TRANSCRIPTS === 'true' ? event : { ...metadata, ...(text ? { transcriptChars: text.length } : {}) };
     logQueue = logQueue.then(async () => {
       await mkdir('results', { recursive: true, mode: 0o700 });
-      await appendFile(`results/live-${sessionId}.jsonl`, JSON.stringify({ sessionId, config: publicRunConfig(), ...logged }) + '\n', { mode: 0o600 });
+      await appendFile(`results/live-${sessionId}.jsonl`, JSON.stringify({ sessionId, config: { ...publicRunConfig(), outputMode, transport: transportFor(outputMode) }, ...logged }) + '\n', { mode: 0o600 });
     }).catch(() => send({ type: 'fatal', message: 'Local result log could not be written. Call stopped to avoid unrecorded measurements.' }));
   };
   const heartbeat = setInterval(() => send({ type: 'heartbeat' }), 2000);
   ws.on('message', async raw => {
     const now = performance.now();
     if (now - windowStart > 60000) { messages = 0; windowStart = now; }
-    if (++messages > 240) { send({ type: 'fatal', message: 'Local message rate limit exceeded.' }); return; }
     let value: unknown;
     try { value = JSON.parse(raw.toString()); }
     catch { send({ type: 'fatal', message: 'Invalid browser message JSON.' }); return; }
@@ -103,9 +110,22 @@ wss.on('connection', ws => {
     if (!parsed.success) { send({ type: 'fatal', message: 'Invalid browser message schema.' }); return; }
     const message = parsed.data;
     if (closed) return;
-    if (message.type === 'connect') {
+    if (message.type === 'audio-input') {
+      if (outputMode !== 'gated' || !azure || !engine) { send({ type: 'fatal', message: 'Native audio arrived before gated session readiness.' }); return; }
+      try {
+        const bytes = decodePcm(message.data);
+        if (now - audioWindow >= 1000) { audioWindow = now; audioBytes = 0; }
+        audioBytes += bytes.byteLength;
+        if (bytes.byteLength > 4800 || audioBytes > 72000) throw new Error('Audio input rate limit.');
+        azure.send({ type: 'input_audio_buffer.append', audio: message.data });
+      } catch { send({ type: 'fatal', message: 'Invalid or excessive native PCM input. Call stopped.' }); }
+      return;
+    }
+    if (++messages > 240) { send({ type: 'fatal', message: 'Local message rate limit exceeded.' }); return; }
+    if (message.type === 'connect' || message.type === 'connect-gated') {
       if (starting || engine || liveBusy || evaluating) { send({ type: 'fatal', message: 'Only one local call or evaluation can run at a time.' }); return; }
       starting = true; liveBusy = true; ownsCall = true;
+      outputMode = message.outputMode;
       try {
         const judge = createJudge(message.provider);
         engine = new GuardrailEngine(judge, {
@@ -114,13 +134,17 @@ wss.on('connection', ws => {
             if (azure) azure.send(event);
             else send({ type: 'fatal', message: 'Azure sideband not ready; response was not sent.' });
           },
-        }, env.JUDGE_TIMEOUT_MS);
-        azure = await connectAzure(message.sdp, message.mode, controller.signal,
-          event => engine?.receive(event), message => engine?.fault(message));
+        }, env.JUDGE_TIMEOUT_MS, outputMode);
+        const onEvent = (event: Parameters<GuardrailEngine['receive']>[0]) => engine?.receive(event);
+        const onFailure = (message: string) => engine?.fault(message);
+        azure = message.type === 'connect-gated'
+          ? await connectGatedAzure(message.mode, controller.signal, onEvent, onFailure)
+          : await connectAzure(message.sdp, message.mode, controller.signal, onEvent, onFailure);
         if (closed) { azure.close(); return; }
-        send({ type: 'answer', sdp: azure.answer });
+        if ('answer' in azure && typeof azure.answer === 'string') send({ type: 'answer', sdp: azure.answer });
         send({ type: 'ready' });
-        log({ id: randomUUID(), kind: 'status', name: `Native call configured: ${message.mode}; judge ${message.provider}`, source: 'live', clock: 'server', atMs: performance.now() - began });
+        log({ id: randomUUID(), kind: 'status', name: `Native call configured: ${message.mode}; judge ${message.provider}; output ${outputMode}`,
+          outputMode, transport: transportFor(outputMode), source: 'live', clock: 'server', atMs: performance.now() - began });
       } catch (error) {
         console.error('Native connection failed:', error instanceof GuardrailError ? error.code : 'configuration-or-transport');
         send({ type: 'fatal', message: errorMessage(error) });
@@ -129,9 +153,11 @@ wss.on('connection', ws => {
     else if (message.type === 'armed') engine?.armed(message.requestId);
     else if (message.type === 'barge-in') engine?.speechStarted(message.itemId);
     else if (message.type === 'muted') engine?.muted(message.actionId, message.durationMs);
+    else if (message.type === 'local-playback') engine?.localPlayback(message.responseId, message.requestId, message.state);
     else if (message.type === 'metric') log({
       id: randomUUID(), kind: 'metric', name: message.name, source: 'live', clock: 'browser',
       atMs: message.atMs, durationMs: message.durationMs, responseId: message.responseId,
+      outputMode, transport: transportFor(outputMode),
     });
   });
   ws.on('close', cleanup);

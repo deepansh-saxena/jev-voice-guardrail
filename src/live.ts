@@ -12,7 +12,10 @@ export class LiveCall {
   private dc?: RTCDataChannel;
   private ws?: WebSocket;
   private stream?: MediaStream;
-  private audio = new Audio();
+  private remoteRenderer = new Audio();
+  private muted = true;
+  private outputGain?: GainNode;
+  private outputSource?: MediaStreamAudioSourceNode;
   private audioContext?: AudioContext;
   private analyser?: AnalyserNode;
   private frame?: number;
@@ -41,10 +44,11 @@ export class LiveCall {
         return;
       }
       this.callbacks.status('Requesting microphone');
-      this.audio.autoplay = true;
-      this.audio.muted = true;
+      this.remoteRenderer.muted = true;
       this.audioContext = new AudioContext();
       await this.audioContext.resume();
+      this.outputGain = this.audioContext.createGain();
+      this.outputGain.gain.value = 0;
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
       if (this.stopped) { stream.getTracks().forEach(track => track.stop()); return; }
       this.stream = stream;
@@ -55,14 +59,19 @@ export class LiveCall {
       pc.ontrack = event => {
         if (this.stopped) { event.track.stop(); return; }
         const remote = event.streams[0] ?? new MediaStream([event.track]);
-        this.audio.srcObject = remote;
-        if (this.audioContext) {
+        // Chromium needs a playing media renderer to pull remote WebRTC audio into Web Audio.
+        // This renderer stays muted; only the guardrail-controlled gain can reach speakers.
+        this.remoteRenderer.srcObject = remote;
+        void this.remoteRenderer.play().catch(() => this.fail('Browser audio playback could not start. Allow sound for this site, then start a new call.'));
+        if (this.audioContext && this.outputGain) {
           this.analyser = this.audioContext.createAnalyser();
           this.analyser.fftSize = 512;
-          this.audioContext.createMediaStreamSource(remote).connect(this.analyser);
+          this.outputSource = this.audioContext.createMediaStreamSource(remote);
+          this.outputSource.connect(this.outputGain);
+          this.outputGain.connect(this.analyser);
+          this.analyser.connect(this.audioContext.destination);
           this.measureEnergy();
         }
-        void this.audio.play().catch(() => this.fail('Audio playback permission was denied. Allow sound and start a new call.'));
       };
       pc.onconnectionstatechange = () => {
         if (['disconnected', 'failed', 'closed'].includes(pc.connectionState) && !this.stopped)
@@ -80,7 +89,7 @@ export class LiveCall {
           switch (realtime.type) {
             case 'input_audio_buffer.speech_started': {
               const before = performance.now();
-              this.audio.muted = true;
+              this.setMuted(true);
               this.armedId = undefined;
               this.currentInput = realtime.item_id;
               this.speaking = true;
@@ -137,7 +146,7 @@ export class LiveCall {
       this.ws = ws;
       ws.onopen = () => {
         if (this.stopped) { ws.close(); return; }
-        this.send({ type: 'connect', sdp: offer.sdp!, provider, mode });
+        this.send({ type: 'connect', outputMode: 'monitor', sdp: offer.sdp!, provider, mode });
       };
       ws.onmessage = async event => {
         if (this.stopped) return;
@@ -157,11 +166,11 @@ export class LiveCall {
             if (this.currentInput !== message.inputItemId || this.speaking) return;
             this.armedId = message.requestId;
             this.authorizedRequests.add(message.requestId);
-            this.audio.muted = false;
+            this.setMuted(false);
             this.send({ type: 'armed', requestId: message.requestId });
           } else if (message.type === 'mute') {
             const start = performance.now();
-            this.audio.muted = true;
+            this.setMuted(true);
             this.armedId = undefined;
             this.send({ type: 'muted', actionId: message.actionId, durationMs: performance.now() - start });
           }
@@ -186,6 +195,10 @@ export class LiveCall {
     this.callbacks.status('Listening');
   }
   private send(message: ClientMessage) { if (!this.stopped && this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message)); }
+  private setMuted(value: boolean) {
+    this.muted = value;
+    if (this.outputGain) this.outputGain.gain.value = value ? 0 : 1;
+  }
   private metric(name: Extract<ClientMessage, { type: 'metric' }>['name'], durationMs: number) {
     const atMs = performance.now() - this.startAt;
     this.send({ type: 'metric', name, durationMs, atMs, responseId: this.responseId });
@@ -203,7 +216,7 @@ export class LiveCall {
     const samples = new Float32Array(this.analyser.fftSize);
     this.analyser.getFloatTimeDomainData(samples);
     const energy = Math.sqrt(samples.reduce((sum, value) => sum + value * value, 0) / samples.length);
-    if (!this.audio.muted && this.playbackAt !== undefined && !this.energyMeasured && energy > 0.015 && this.speechEnd !== undefined) {
+    if (!this.muted && this.playbackAt !== undefined && !this.energyMeasured && energy > 0.015 && this.speechEnd !== undefined) {
       this.energyMeasured = true;
       this.metric('speech-end-to-audio-energy', performance.now() - this.speechEnd);
     }
@@ -216,13 +229,16 @@ export class LiveCall {
   }
   stop() {
     if (this.stopped) return;
-    this.audio.muted = true;
-    this.audio.pause();
+    this.setMuted(true);
+    this.remoteRenderer.pause();
+    this.remoteRenderer.srcObject = null;
     this.send({ type: 'stop' });
     this.stopped = true;
     this.stream?.getTracks().forEach(track => { track.enabled = false; track.stop(); });
     this.pc?.getReceivers().forEach(receiver => receiver.track?.stop());
-    this.audio.srcObject = null;
+    this.outputSource?.disconnect();
+    this.outputGain?.disconnect();
+    this.analyser?.disconnect();
     this.dc?.close();
     this.pc?.close();
     this.ws?.close();

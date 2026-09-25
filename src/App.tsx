@@ -3,10 +3,12 @@ import { Activity, ArrowDownToLine, ArrowRight, AudioLines, BookOpen, Check, Che
 import { cases } from '../shared/cases';
 import { CHECK_INTERVAL_MS, KB_VERSION, knowledge, phasePolicies, policies, POLICY_VERSION, type AgentMode } from '../shared/policies';
 import { distribution } from '../shared/metrics';
-import type { LabEvent, Provider, Readiness } from '../shared/protocol';
+import { transportFor, type LabEvent, type OutputMode, type Provider, type Readiness } from '../shared/protocol';
 import type { EvalResult } from '../server/evaluation';
 import { examples, playFixture } from './fixture';
 import { LiveCall } from './live';
+import { GatedLiveCall } from './gated-live';
+import { appendHistory, emptyHistory, incidentCounts, incidentDetail, incidentLabel, inputCheckFor, inputTextFor, outputPauseFor, outputPauseLabel, policyNames, timelineLabel } from './guardrail-history';
 
 const ms = (n: number | null | undefined) => n == null ? '--' : `${Math.round(n)} ms`;
 const providerName = (p: string) => p === 'jev' ? 'Jev' : p === 'llm' ? 'LLM judge' : 'Fixture oracle';
@@ -31,9 +33,11 @@ export default function App() {
   const [source, setSource] = useState<'fixture' | 'live'>('live');
   const [provider, setProvider] = useState<Provider>('jev');
   const [mode, setMode] = useState<AgentMode>('normal');
+  const [outputMode, setOutputMode] = useState<OutputMode>('monitor');
   const [example, setExample] = useState('roadmap');
   const [ready, setReady] = useState<Readiness>();
   const [events, setEvents] = useState<LabEvent[]>([]);
+  const [history, setHistory] = useState(emptyHistory);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState('Ready to explore');
   const [error, setError] = useState<string>();
@@ -44,7 +48,11 @@ export default function App() {
   const stopRef = useRef<(() => void) | undefined>(undefined);
   const evalAbort = useRef<AbortController | undefined>(undefined);
   const eventEnd = useRef<HTMLDivElement>(null);
-  const emit = (event: LabEvent) => setEvents(previous => [...previous.slice(-599), event]);
+  const emit = (event: LabEvent) => {
+    setEvents(previous => [...previous.slice(-599), event]);
+    setHistory(previous => appendHistory(previous, event));
+  };
+  const resetSession = () => { setEvents([]); setHistory(emptyHistory()); setError(undefined); };
   useEffect(() => {
     const controller = new AbortController();
     fetch('/api/readiness', { signal: controller.signal }).then(async res => {
@@ -70,16 +78,20 @@ export default function App() {
   const inputMetrics = distribution(checks.filter(e => e.phase === 'input').flatMap(e => e.verdict?.serviceMs == null ? [] : [e.verdict.serviceMs]));
   const outputMetrics = distribution(checks.filter(e => e.phase === 'output').flatMap(e => e.verdict?.serviceMs == null ? [] : [e.verdict.serviceMs]));
   const audioMetrics = distribution(events.filter(e => e.kind === 'metric' && e.name === 'speech-end-to-audio-energy').flatMap(e => e.durationMs === undefined ? [] : [e.durationMs]));
-  const interruptions = events.filter(e => e.kind === 'interrupt' && /violation|detect and interrupt/.test(e.name)).length;
+  const counts = incidentCounts(history);
+  const gateWait = distribution(events.filter(e => e.name === 'gated-whole-response-wait').flatMap(e => e.durationMs === undefined ? [] : [e.durationMs]));
+  const latestDelivery = events.findLast(e => e.delivery);
+  const clarifications = Object.values(history.inputChecks).filter(e => e.verdict?.decision === 'uncertain');
   const shownStatus = active ? (events.findLast(e => e.kind === 'status' || e.kind === 'lifecycle')?.name ?? status) : status;
   const stop = () => { stopRef.current?.(); stopRef.current = undefined; setActive(false); setStatus('Stopped'); };
   const start = () => {
-    setEvents([]); setError(undefined); setActive(true);
+    resetSession(); setError(undefined); setActive(true);
     if (source === 'fixture') {
       setStatus('Playing authored events');
-      stopRef.current = playFixture(example, mode, emit, () => { setActive(false); setStatus('Fixture complete'); stopRef.current = undefined; });
+      stopRef.current = playFixture(example, mode, emit, () => { setActive(false); setStatus('Fixture complete'); stopRef.current = undefined; }, outputMode);
     } else {
-      const call = new LiveCall({ event: emit, status: setStatus, error: message => { setError(message); setActive(false); } });
+      const Call = outputMode === 'gated' ? GatedLiveCall : LiveCall;
+      const call = new Call({ event: emit, status: setStatus, error: message => { setError(message); setActive(false); } });
       stopRef.current = () => call.stop();
       void call.start(provider, mode);
     }
@@ -121,7 +133,7 @@ export default function App() {
       <main>
         <div className="page-heading">
           <div><div className="eyebrow">RELAY GUARDRAIL LAB</div><h1>{tab === 'lab' ? <>Voice, with boundaries<span>.</span></> : tab === 'replay' ? <>Same evidence. Honest comparison<span>.</span></> : <>Context is part of the test<span>.</span></>}</h1>
-            <p>{tab === 'lab' ? 'A hands-on lab for input gates and live output interruption.' : tab === 'replay' ? 'Replay authored transcript snapshots independently through both judges.' : 'Versioned operating policies, grounded in a fully synthetic product.'}</p></div>
+            <p>{tab === 'lab' ? 'A hands-on lab for input gates, gated speech and live output interruption.' : tab === 'replay' ? 'Replay authored transcript snapshots independently through both judges.' : 'Versioned operating policies, grounded in a fully synthetic product.'}</p></div>
           <Badge tone={source === 'fixture' ? 'amber' : 'green'}><FlaskConical size={13} />{source === 'fixture' ? 'Fixture mode' : 'Live providers'}</Badge>
         </div>
         {error && <div className="error-banner" role="alert"><TriangleAlert size={19} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError(undefined)}><X size={16} /></button></div>}
@@ -133,19 +145,41 @@ export default function App() {
               : 'Reading the local backend configuration. No microphone has been requested.'}</p>
               <div className="missing-settings">{missingLive.map(key => <code key={key}>{key}</code>)}</div>
               {missingLive.includes('AZURE_TRANSCRIPTION_DEPLOYMENT') && <p>Use an existing transcription deployment name on the same Azure resource as Realtime. A realtime deployment name is not a transcription deployment.</p>}
-              <button className="text-button" disabled={busy} onClick={() => setSource('fixture')}>Explore a simulated fixture instead <ArrowRight size={13} /></button></div>
+              <button className="text-button" disabled={busy} onClick={() => { setSource('fixture'); resetSession(); }}>Explore a simulated fixture instead <ArrowRight size={13} /></button></div>
           </section>}
-          <div className="mode-banner"><FlaskConical size={18} /><div><strong>{source === 'fixture' ? 'Explore without credentials.' : 'Native Azure speech-to-speech.'}</strong> {source === 'fixture' ? 'Authored text and event playback. No microphone, recordings, model predictions or measured provider latency.' : 'Input gates response creation, not audio ingestion. Output is detect-and-interrupt, not zero leakage.'}</div><button onClick={() => setTab('replay')}>About the evidence <ArrowRight size={14} /></button></div>
+          <div className="mode-banner"><FlaskConical size={18} /><div><strong>{source === 'fixture' ? 'Explore without credentials.' : 'Native Azure speech-to-speech.'}</strong> {source === 'fixture' ? 'Authored text and event playback. No microphone, recordings, model predictions or measured provider latency.' : outputMode === 'gated' ? 'Input stays gated. Native output stays inaudible until the whole response receives a final allow.' : 'Input gates response creation, not audio ingestion. Output is detect-and-interrupt, not zero leakage.'}</div><button onClick={() => setTab('replay')}>About the evidence <ArrowRight size={14} /></button></div>
           <section className="configuration card" aria-label="Session configuration">
-            <div className="config-field"><label>SESSION SOURCE</label><div className="segmented"><button disabled={busy} className={source === 'fixture' ? 'chosen' : ''} onClick={() => { setSource('fixture'); setEvents([]); }}><FlaskConical size={14} />Fixture</button><button disabled={busy} className={source === 'live' ? 'chosen' : ''} onClick={() => { setSource('live'); setEvents([]); }}><Radio size={14} />Live</button></div></div>
+            <div className="config-field"><label>SESSION SOURCE</label><div className="segmented"><button disabled={busy} className={source === 'fixture' ? 'chosen' : ''} onClick={() => { setSource('fixture'); resetSession(); }}><FlaskConical size={14} />Fixture</button><button disabled={busy} className={source === 'live' ? 'chosen' : ''} onClick={() => { setSource('live'); resetSession(); }}><Radio size={14} />Live</button></div></div>
             <div className="config-field"><label htmlFor="judge">ENFORCING JUDGE</label><select id="judge" disabled={busy || source === 'fixture'} value={provider} onChange={e => setProvider(e.target.value as Provider)}>{source === 'fixture' ? <option value={provider}>Authored fixture oracle</option> : <><option value="jev">Jev · TypeSafe</option><option value="llm">Structured-output LLM</option></>}</select></div>
             <div className="config-field agent-config"><label>VOICE CONFIGURATION</label><div className="segmented"><button disabled={busy} className={mode === 'normal' ? 'chosen' : ''} onClick={() => setMode('normal')}>Normal agent</button><button disabled={busy} className={mode === 'stress' ? 'chosen stress' : ''} onClick={() => setMode('stress')}>Stress test</button></div></div>
           </section>
+          <section className="card delivery-options" aria-label="Output delivery configuration">
+            <div><label htmlFor="output-delivery">OUTPUT DELIVERY</label><select id="output-delivery" disabled={busy} value={outputMode} onChange={e => { setOutputMode(e.target.value as OutputMode); resetSession(); }}><option value="monitor">Monitor while speaking</option><option value="gated">Gate before speaking</option></select></div>
+            <p>{outputMode === 'gated' ? 'Wait for the complete native response and final guardrail approval, then play from the beginning. Maximum 30 seconds of audio; rejected audio is discarded.' : 'Play native audio as it arrives while guardrails check it. Some speech can be heard before detection and interruption.'}<small>Transport: {source === 'fixture' ? 'simulated; no media transport' : outputMode === 'gated' ? 'Azure native WebSocket PCM via local relay' : 'Azure direct WebRTC + server sideband'}. Both modes screen input and output. Cross-mode timing includes the relay difference, not just gating or judge speed.</small></p>
+          </section>
           {mode === 'stress' && <div className="stress-note"><TriangleAlert size={15} />Synthetic output restrictions are enforced externally only. Same knowledge, unchanged input gates. Not representative of normal model failure rates.</div>}
+          <section className={`card incident-panel ${history.incidents.length ? 'has-incidents' : ''}`} aria-label="Guardrail incident history" aria-live="polite">
+            <div className="section-header"><h2><ShieldCheck size={17} />Guardrail activity</h2><Badge tone={history.incidents.length ? 'red' : 'neutral'}>{source === 'fixture' ? 'Simulated session history' : 'Current session history'}</Badge></div>
+            <p className="incident-summary">{counts.inputBlocks} input blocked turns · {counts.gatedOutputBlocks} output blocked before playback · {counts.outputInterruptions} {source === 'fixture' ? 'simulated' : 'confirmed'} streaming interruptions · {counts.outputViolations} output violation responses</p>
+            {outputMode === 'gated' && latestDelivery && <div className={`gate-delivery ${latestDelivery.delivery}`} role="status"><strong>{source === 'fixture' ? 'SIMULATED ' : ''}{latestDelivery.delivery === 'held' ? 'OUTPUT HELD / CHECKING' : latestDelivery.delivery === 'approved' ? 'OUTPUT APPROVED' : latestDelivery.delivery === 'playing' ? 'APPROVED OUTPUT PLAYING' : latestDelivery.delivery === 'ended' ? 'LOCAL PLAYBACK ENDED' : 'HELD OUTPUT DISCARDED'}</strong><p>{latestDelivery.name}</p></div>}
+            {!history.incidents.length && <p className="incident-empty">No policy violations recorded. Clarifications, user barge-in and technical errors are not policy violations.</p>}
+            {!!history.incidents.length && <ol className="incident-list">{[...history.incidents].reverse().map(incident => {
+              const input = inputTextFor(history, incident.first);
+              return <li key={incident.key} className="guardrail-incident">
+                <div className="incident-heading"><strong>{incidentLabel(incident)}</strong><span>{policyNames(incident.policies)}</span></div>
+                <p>{incidentDetail(incident)}</p>
+                <blockquote>{input ? `“${input.length > 240 ? `${input.slice(0, 240)}...` : input}”` : `Input turn ${incident.first.turn ?? 'unavailable'}; transcript not available in this view.`}</blockquote>
+                <small>Turn {incident.first.turn ?? '--'} · {(incident.first.atMs / 1000).toFixed(2)}s {incident.first.clock} clock · {providerName(incident.first.verdict?.provider ?? '')} · {incident.first.source === 'fixture' ? 'Authored timing, not measured' : `${ms(incident.first.verdict?.serviceMs)} judge decision`}</small>
+              </li>;
+            })}</ol>}
+            {!!clarifications.length && <div className="clarification-history" aria-label="Input clarification history">{[...clarifications].reverse().map(event => <div key={event.id} className="clarification-notice"><strong>{source === 'fixture' ? 'SIMULATED ' : ''}NEEDS CLARIFICATION</strong><span>Turn {event.turn ?? '--'} · {inputTextFor(history, event) ?? 'Input transcript unavailable'} · {providerName(event.verdict?.provider ?? '')} · {ms(event.verdict?.serviceMs)}</span><p>Uncertain input, not a confirmed policy violation. A clarification may follow.</p></div>)}</div>}
+            {history.latestError && <div className="unavailable-notice"><strong>GUARDRAIL UNAVAILABLE</strong><p>{history.latestError.name}</p><small>Technical/session failure; not counted as a policy violation.</small></div>}
+            <p className="incident-foot">Safe redirects and later passes do not erase this history. It resets when a new session starts or the source changes.</p>
+          </section>
           <div className="lab-grid">
             <div className="lab-primary">
               <section className="voice-stage">
-                <div className="stage-top"><Badge tone="dark"><span className={active ? 'pulse-dot' : 'idle-dot'} />{source === 'fixture' ? 'SYNTHETIC EVENT STREAM' : 'NATIVE WEBRTC AUDIO'}</Badge><Headphones size={18} /></div>
+                <div className="stage-top"><Badge tone="dark"><span className={active ? 'pulse-dot' : 'idle-dot'} />{source === 'fixture' ? 'SYNTHETIC EVENT STREAM' : outputMode === 'gated' ? 'NATIVE PCM RELAY · GATED' : 'NATIVE WEBRTC AUDIO'}</Badge><Headphones size={18} /></div>
                 <div className="stage-center"><div className="voice-symbol"><AudioLines size={25} /></div><h2>{active ? (source === 'fixture' ? 'Watching the boundaries' : 'Relay is listening') : source === 'live' && !liveReady ? 'Finish live voice setup' : 'Meet your Relay assistant'}</h2><p>{source === 'fixture' ? 'See how a conversation moves through the guardrails.' : 'Ask about plans, billing or support. Headphones recommended.'}</p><Waveform active={active} /></div>
                 <div className="stage-bottom"><div className="stage-status"><span className={active ? 'pulse-dot' : 'idle-dot'} /><span>{source === 'live' && !liveReady ? 'Setup required · microphone off' : shownStatus}</span></div>
                   <button className={`primary-button ${active ? 'stop-button' : ''}`} disabled={!active && (evaluating || (source === 'live' && !liveReady))} onClick={active ? stop : start}>{active ? <Square size={15} fill="currentColor" /> : source === 'fixture' ? <Play size={16} fill="currentColor" /> : <Mic size={17} />}{active ? 'Stop session' : source === 'fixture' ? 'Play fixture' : 'Start microphone'}</button></div>
@@ -153,8 +187,17 @@ export default function App() {
 
               <section className="card conversation"><div className="section-header"><h2><AudioLines size={17} />Conversation</h2><Badge>{source === 'fixture' ? 'Authored text' : 'Generated transcript'}</Badge></div>
                 <div className="messages" aria-live="polite">
-                  {!transcripts.size ? <div className="empty-conversation"><div className="empty-icon"><Mic size={23} /></div><strong>A little conversation. A lot of visibility.</strong><p>Pick an example below, then {source === 'fixture' ? 'play the fixture' : 'start your microphone'}.</p></div> : [...transcripts.values()].map(event => <div className={`message ${event.role}`} key={event.id}>
-                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : source === 'fixture' ? 'Synthetic · not spoken' : 'Monitored · not audio-aligned'}</span></div><p>{event.text}</p></div></div>)}
+                  {!transcripts.size ? <div className="empty-conversation"><div className="empty-icon"><Mic size={23} /></div><strong>A little conversation. A lot of visibility.</strong><p>Pick an example below, then {source === 'fixture' ? 'play the fixture' : 'start your microphone'}.</p></div> : [...transcripts.values()].map(event => {
+                    const checked = event.role === 'user' ? inputCheckFor(history, event) : undefined;
+                    const audioPause = event.role === 'assistant' ? outputPauseFor(history, event) : undefined;
+                    const decision = checked?.verdict?.decision;
+                    const flagged = checked?.verdict?.policies.filter(p => p.decision === decision && p.decision !== 'allow').map(p => p.policy) ?? [];
+                    return <div className={`message ${event.role}`} key={event.id}>
+                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : source === 'fixture' ? 'Synthetic · not spoken' : 'Monitored · not audio-aligned'}</span></div><p>{event.text}</p>
+                      {decision && <div className="message-guardrail"><Badge tone={decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'green'}>{source === 'fixture' ? 'SIMULATED ' : ''}{decision === 'violate' ? 'INPUT BLOCKED' : decision === 'uncertain' ? 'NEEDS CLARIFICATION' : 'INPUT ALLOWED'}{flagged.length ? `: ${policyNames(flagged)}` : ''}</Badge>{decision === 'violate' && <small>Original answer blocked before generation.</small>}</div>}
+                      {audioPause && <div className="message-guardrail"><Badge tone={audioPause.verdict?.decision === 'violate' ? 'red' : 'amber'}>{source === 'fixture' ? 'SIMULATED ' : ''}{outputPauseLabel(audioPause)}</Badge><small>Generated text is not proof of heard audio. A separate recovery may follow.</small></div>}
+                    </div></div>;
+                  })}
                   <div ref={eventEnd} />
                 </div>
                 <div className="conversation-foot"><CircleHelp size={13} />Assistant text can include generated words that were never heard.</div>
@@ -162,27 +205,28 @@ export default function App() {
               <section className="examples"><div className="section-header"><h2>Try a conversation</h2><span>Authored scenarios</span></div><div className="example-grid">{examples.map(item => <button key={item.id} disabled={busy} className={`example ${example === item.id ? 'picked' : ''}`} onClick={() => setExample(item.id)}><span>{item.category}<ArrowRight size={13} /></span><strong>{item.title}</strong><p>“{item.text}”</p></button>)}</div>{source === 'live' && <p className="muted-note">Examples are speaking prompts; selecting one does not inject text or trigger a response.</p>}</section>
             </div>
             <div className="lab-secondary">
-              <section className="card policy-panel"><div className="section-header"><h2><ShieldCheck size={17} />Guardrail monitor</h2><span className="local-dot" /></div>
-                {(['input', 'output'] as const).map(phase => <div className="policy-group" key={phase}><div className="group-heading"><span className={`direction ${phase}`}>{phase === 'input' ? 'IN' : 'OUT'}</span><div><strong>{phase === 'input' ? 'Before the response' : 'While audio plays'}</strong><small>{phase === 'input' ? 'Allow, redirect or clarify' : `New-text checks every ${CHECK_INTERVAL_MS} ms`}</small></div></div>
+              <section className="card policy-panel"><div className="section-header"><h2><ShieldCheck size={17} />Guardrail monitor</h2><span>Latest checks only</span></div>
+                {(['input', 'output'] as const).map(phase => <div className="policy-group" key={phase}><div className="group-heading"><span className={`direction ${phase}`}>{phase === 'input' ? 'IN' : 'OUT'}</span><div><strong>{phase === 'input' ? 'Before the response' : outputMode === 'gated' ? 'Before local playback' : 'While audio plays'}</strong><small>{phase === 'input' ? 'Allow, redirect or clarify' : outputMode === 'gated' ? 'Complete final allow required' : `New-text checks every ${CHECK_INTERVAL_MS} ms`}</small></div></div>
                   {phasePolicies(phase).map(policy => {
                     const decision = (phase === 'input' ? inputCheck : outputCheck)?.verdict?.policies.find(p => p.policy === policy.id)?.decision;
                     return <div className="policy-row" key={policy.id}><span>{policy.name}</span><Badge tone={decision === 'allow' ? 'green' : decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'neutral'}>{decision === 'allow' ? <Check size={11} /> : decision === 'violate' ? <Square size={8} fill="currentColor" /> : null}{decision === 'allow' && phase === 'output' ? 'Clear so far' : decision ?? 'Waiting'}</Badge></div>;
                   })}</div>)}
-                <div className="policy-foot"><LockKeyhole size={13} />A pass never approves future output.</div>
+                <div className="policy-foot"><LockKeyhole size={13} />Latest verdicts only. Earlier triggers stay in Guardrail activity.</div>
               </section>
               <section className="card readiness"><div className="section-header"><h2>Provider readiness</h2><span>Config only</span></div>
                 {(['azure', 'jev', 'llm'] as const).map(key => <div className="provider-row" key={key}><span className={`provider-icon ${key}`}>{key === 'azure' ? 'A' : key === 'jev' ? 'J' : 'L'}</span><div><strong>{key === 'azure' ? 'Azure Realtime' : providerName(key)}</strong><small>{ready?.[key].configured ? 'Configuration present' : 'Configuration incomplete'}</small>{ready?.verification?.[key] && <small className="verification-note" title={ready.verification[key].checkedAt}>Prior check: {ready.verification[key].summary}</small>}</div><span className={`readiness-dot ${ready?.[key].configured ? 'is-ready' : ''}`} /></div>)}
                 <details><summary>Required local configuration <ChevronRight size={13} /></summary><p>Edit <code>.env</code> and restart the API. Keys stay on the server.</p>{ready && [...ready.azure.missing, ...ready.jev.missing, ...ready.llm.missing].map(name => <code className="env-name" key={name}>{name}</code>)}<p>No automatic mock-provider fallback.</p></details>
               </section>
-              <section className="principle"><div><Activity size={17} /><strong>Interrupt, don’t overclaim.</strong></div><p>No intentional pre-playback buffer. Some speech may be heard before a violation is detected. Fixture timings are not benchmarks.</p></section>
+              <section className="principle"><div><Activity size={17} /><strong>Observe, don’t overclaim.</strong></div><p>{outputMode === 'gated' ? 'Whole-response buffering adds waiting. Semantic judgments can still be wrong; browser playback controls are cooperative, not tamper-proof.' : 'No intentional pre-playback buffer. Some speech may be heard before a violation is detected.'} Fixture timings are not benchmarks.</p></section>
             </div>
           </div>
-          <section className="metric-strip card"><div className="metric"><span>INPUT JUDGE</span><strong>{ms(inputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(inputMetrics.p95)} · n={inputMetrics.count}</p></div><div className="metric"><span>OUTPUT JUDGE</span><strong>{ms(outputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(outputMetrics.p95)} · n={outputMetrics.count}</p></div><div className="metric"><span>SPEECH END → AUDIO ENERGY</span><strong>{ms(audioMetrics.p50)}<small>p50</small></strong><p>Browser estimate · not hardware-audible time</p></div><div className="metric"><span>{source === 'fixture' ? 'SIMULATED INTERRUPTIONS' : 'DETECTED VIOLATIONS'}</span><strong>{checks.length ? interruptions : '--'}</strong><p>{source === 'fixture' ? 'No measured provider samples' : 'Outages are not detections'}</p></div></section>
-          <section className="card timeline"><div className="section-header"><h2><Activity size={17} />Event timeline</h2><button className="text-button" disabled={!events.length} onClick={() => download({ source, events, policyVersion: POLICY_VERSION, kbVersion: KB_VERSION }, 'relay-session.json')}><ArrowDownToLine size={14} />Export JSON</button></div><div className="timeline-body">{events.filter(e => e.kind !== 'transcript').length ? events.filter(e => e.kind !== 'transcript').slice(-50).map(event => <div className="timeline-row" key={event.id}><span className={`timeline-dot ${event.kind}`} /><time>{(event.atMs / 1000).toFixed(2)}s</time><span>{event.name}</span><small>{event.durationMs !== undefined ? ms(event.durationMs) : event.verdict?.serviceMs != null ? ms(event.verdict.serviceMs) : event.clock}</small></div>) : <div className="empty-timeline">Your session events will appear here. Browser and server clocks are recorded separately.</div>}</div></section>
+          <section className="metric-strip card"><div className="metric"><span>INPUT JUDGE</span><strong>{ms(inputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(inputMetrics.p95)} · n={inputMetrics.count}</p></div><div className="metric"><span>OUTPUT JUDGE</span><strong>{ms(outputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(outputMetrics.p95)} · n={outputMetrics.count}</p></div><div className="metric"><span>SPEECH END → AUDIO ENERGY</span><strong>{ms(audioMetrics.p50)}<small>p50</small></strong><p>Output sink estimate · not hardware-audible time</p></div><div className="metric" aria-label="Input blocked turns"><span>{source === 'fixture' ? 'SIMULATED INPUT BLOCKS' : 'INPUT BLOCKED TURNS'}</span><strong>{counts.inputBlocks}</strong><p>One count per turn, not per policy</p></div><div className="metric" aria-label={outputMode === 'gated' ? 'Output blocked responses' : 'Output interruptions'}><span>{source === 'fixture' ? 'SIMULATED ' : ''}{outputMode === 'gated' ? 'OUTPUT BLOCKED BEFORE PLAYBACK' : 'OUTPUT INTERRUPTIONS'}</span><strong>{outputMode === 'gated' ? counts.gatedOutputBlocks : counts.outputInterruptions}</strong><p>{counts.outputViolations} violation responses · {source === 'fixture' ? 'No measured provider samples' : outputMode === 'gated' ? 'Rejected held responses; not speech interruptions' : 'Requires browser mute during provider playback; not hardware silence'}</p></div></section>
+          {outputMode === 'gated' && <p className="muted-note">Whole-response wait: p50 {ms(gateWait.p50)} · p95 {ms(gateWait.p95)} · n={gateWait.count}. Browser response-start receipt to approved output-sink energy; includes collection, relay and gate waiting, separate from judge HTTP time.</p>}
+          <section className="card timeline"><div className="section-header"><h2><Activity size={17} />Event timeline</h2><button className="text-button" disabled={!events.length} onClick={() => download({ source, outputMode, transport: source === 'fixture' ? 'simulated' : transportFor(outputMode), events, incidents: history.incidents, policyVersion: POLICY_VERSION, kbVersion: KB_VERSION }, 'relay-session.json')}><ArrowDownToLine size={14} />Export JSON</button></div><div className="timeline-body">{events.filter(e => e.kind !== 'transcript').length ? events.filter(e => e.kind !== 'transcript').slice(-50).map(event => <div className="timeline-row" key={event.id}><span className={`timeline-dot ${event.kind}`} /><time>{(event.atMs / 1000).toFixed(2)}s</time><span>{timelineLabel(event, history)}</span><small>{event.durationMs !== undefined ? ms(event.durationMs) : event.verdict?.serviceMs != null ? ms(event.verdict.serviceMs) : event.clock}</small></div>) : <div className="empty-timeline">Your session events will appear here. Browser and server clocks are recorded separately.</div>}</div></section>
         </>}
 
         {tab === 'replay' && <>
-          <div className="mode-banner"><Layers3 size={19} /><div><strong>No predetermined winner.</strong> Compare latency alongside accuracy, abstentions and coverage. Authored labels need independent human review.</div></div>
+          <div className="mode-banner"><Layers3 size={19} /><div><strong>No predetermined winner.</strong> Compare latency alongside accuracy, abstentions and coverage. Authored labels need independent human review. Transcript-only replay does not measure gated audio waiting or either mode’s audio transport.</div></div>
           <section className="card replay-controls"><div><h2>Run the same evidence</h2><p>One in-flight request and one replaceable pending snapshot per judge. Identical {CHECK_INTERVAL_MS} ms schedule and timeouts. Independent streams continue after a detection.</p></div><div className="replay-actions"><select aria-label="Evaluation split" value={split} disabled={busy} onChange={e => setSplit(e.target.value as typeof split)}><option value="held-out">Held-out · 30 cases</option><option value="tuning">Tuning · 30 cases</option><option value="all">All · 60 cases</option></select><button className="secondary-button" disabled={busy} onClick={() => void runEval('fixture')}><FlaskConical size={16} />Run fixture replay</button><button className="primary-button" disabled={busy || !ready?.jev.configured || !ready.llm.configured} onClick={() => void runEval('provider-replay')}><Play size={14} />Compare providers</button></div>{evaluating && <div className="evaluation-running" role="status"><span className="pulse-dot" />Replaying snapshots…<button className="text-button" onClick={() => evalAbort.current?.abort()}>Cancel</button></div>}</section>
           <div className="benchmark-grid">{(['jev', 'llm'] as const).map(p => {
             const summary = result?.source === 'provider-replay' ? result.summaries.find(s => s.provider === p) : undefined;

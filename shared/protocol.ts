@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { MAX_TEXT, policyIds, type Phase, type PolicyId } from './policies';
+import type { AudioPartId, AudioPartSummary } from './audio';
 
+export const outputModeSchema = z.enum(['monitor', 'gated']);
+export type OutputMode = z.infer<typeof outputModeSchema>;
+export const transportFor = (mode: OutputMode) => mode === 'gated' ? 'azure-websocket-pcm-relay' : 'azure-webrtc-sideband';
 export const providerSchema = z.enum(['jev', 'llm']);
 export type Provider = z.infer<typeof providerSchema>;
 export const decisionSchema = z.enum(['allow', 'violate', 'uncertain']);
@@ -48,6 +52,9 @@ export interface LabEvent {
   text?: string;
   verdict?: Verdict;
   durationMs?: number;
+  outputMode?: OutputMode;
+  transport?: ReturnType<typeof transportFor>;
+  delivery?: 'held' | 'approved' | 'playing' | 'ended' | 'blocked';
 }
 export interface Readiness {
   azure: { configured: boolean; missing: string[]; transport: string; deployment: string };
@@ -63,15 +70,27 @@ export type ServerMessage =
   | { type: 'event'; event: LabEvent }
   | { type: 'arm'; requestId: string; turn: number; inputItemId: string }
   | { type: 'mute'; actionId: string; responseId?: string; turn: number }
-  | { type: 'fatal'; message: string };
+  | { type: 'fatal'; message: string }
+  | GatedServerMessage;
+export interface AudioIdentity { responseId: string; requestId: string; turn: number }
+export type GatedServerMessage =
+  | { type: 'input-speech'; state: 'started' | 'stopped'; itemId: string; turn: number }
+  | ({ type: 'audio-start' } & AudioIdentity)
+  | { type: 'audio-chunk'; responseId: string; part: AudioPartId; data: string }
+  | { type: 'audio-part-done'; responseId: string; part: AudioPartId }
+  | ({ type: 'audio-complete'; revision: number; parts: AudioPartSummary[] } & AudioIdentity)
+  | ({ type: 'audio-release'; revision: number } & AudioIdentity);
 
 export const clientMessageSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('connect'), sdp: z.string().min(10).max(100000), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('connect'), outputMode: z.literal('monitor').default('monitor'), sdp: z.string().min(10).max(100000), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('connect-gated'), outputMode: z.literal('gated'), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('audio-input'), data: z.string().min(4).max(6400) }).strict(),
+  z.object({ type: z.literal('local-playback'), state: z.enum(['started', 'ended']), responseId: z.string().min(1).max(200), requestId: z.string().min(1).max(100) }).strict(),
   z.object({ type: z.literal('armed'), requestId: z.string().max(100) }).strict(),
   z.object({ type: z.literal('muted'), actionId: z.string().max(100), durationMs: z.number().finite().min(0).max(60000) }).strict(),
   z.object({ type: z.literal('barge-in'), itemId: z.string().max(150) }).strict(),
   z.object({ type: z.literal('stop') }).strict(),
-  z.object({ type: z.literal('metric'), name: z.enum(['speech-end-to-audio-energy', 'transcription-event-delay', 'playback-start-event', 'playback-stop-event', 'local-barge-in-mute', 'transcript-vs-playback-event-offset']), atMs: z.number().finite().min(0).max(86400000), durationMs: z.number().finite().min(-600000).max(600000), responseId: z.string().max(150).optional() }).strict(),
+  z.object({ type: z.literal('metric'), name: z.enum(['speech-end-to-audio-energy', 'gated-whole-response-wait', 'transcription-event-delay', 'playback-start-event', 'playback-stop-event', 'local-barge-in-mute', 'transcript-vs-playback-event-offset']), atMs: z.number().finite().min(0).max(86400000), durationMs: z.number().finite().min(-600000).max(600000), responseId: z.string().max(150).optional() }).strict(),
 ]);
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export const evalRequestSchema = z.object({

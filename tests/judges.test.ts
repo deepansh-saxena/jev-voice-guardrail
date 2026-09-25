@@ -88,8 +88,9 @@ describe('policies, knowledge and protocol', () => {
       expect(aggregate(cases.find(c => c.id === id)!.snapshots.at(-1)!.expected)).toBe('allow');
     expect(phasePolicies('output')).toHaveLength(3);
   });
-  it('ignores unrelated audio bytes but validates allowlisted transcript/lifecycle fields', () => {
-    expect(parseRealtime({ type: 'response.output_audio.delta', delta: 'audio' })).toBeNull();
+  it('validates framed native audio and transcript events while ignoring unrelated events', () => {
+    expect(parseRealtime({ type: 'rate_limits.updated' })).toBeNull();
+    expect(() => parseRealtime({ type: 'response.output_audio.delta', delta: 'audio' })).toThrow();
     expect(() => parseRealtime({ type: 'response.output_audio_transcript.delta', delta: 'missing IDs' })).toThrow();
   });
   it('reports absent metrics as null rather than zero', () => {

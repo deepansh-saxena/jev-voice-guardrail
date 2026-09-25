@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { CHECK_INTERVAL_MS, MAX_TEXT, recovery, type PolicyId } from '../shared/policies';
-import type { Context, JudgeInput, LabEvent, ServerMessage, Verdict } from '../shared/protocol';
+import { transportFor, type Context, type JudgeInput, type LabEvent, type OutputMode, type ServerMessage, type Verdict } from '../shared/protocol';
+import { audioPartKey, decodePcm, MAX_OUTPUT_SECONDS, PcmResponseBuffer, type AudioPartId } from '../shared/audio';
 import type { RealtimeEvent } from '../shared/realtime';
 import { bounded, CoalescingScheduler, errorMessage } from './async';
 import type { Judge } from './judges';
@@ -16,6 +17,7 @@ interface Active {
   deleted: Set<string>; revision: number; checked: number; offered: string;
   done: boolean; playbackStopped: boolean; interrupted: boolean; cleared: boolean;
   muted: boolean; playbackStarted: boolean; clearRequested: boolean; actionId?: string; cancelId?: string; recoveryText?: string;
+  requestId: string; audio: PcmResponseBuffer; audioSealed: boolean; finalChecked: boolean; releaseSent: boolean; localStarted: boolean;
 }
 interface Snapshot extends JudgeInput { responseId: string; revision: number; turn: number }
 interface EngineHooks {
@@ -43,7 +45,7 @@ export class GuardrailEngine {
   private startedAt: number;
   private scheduler: CoalescingScheduler<Snapshot, Verdict>;
 
-  constructor(private judge: Judge, private hooks: EngineHooks, private timeoutMs: number) {
+  constructor(private judge: Judge, private hooks: EngineHooks, private timeoutMs: number, private outputMode: OutputMode = 'monitor') {
     this.now = hooks.now ?? (() => performance.now());
     this.startedAt = this.now();
     this.scheduler = new CoalescingScheduler(
@@ -59,7 +61,8 @@ export class GuardrailEngine {
   }
 
   private emit(event: Omit<LabEvent, 'id' | 'atMs' | 'clock' | 'source'>) {
-    const full: LabEvent = { id: randomUUID(), atMs: this.now() - this.startedAt, clock: 'server', source: 'live', turn: this.turn?.number, ...event };
+    const full: LabEvent = { id: randomUUID(), atMs: this.now() - this.startedAt, clock: 'server', source: 'live', turn: this.turn?.number,
+      outputMode: this.outputMode, transport: transportFor(this.outputMode), ...event };
     this.hooks.browser({ type: 'event', event: full });
     this.hooks.event?.(full);
   }
@@ -75,6 +78,7 @@ export class GuardrailEngine {
     if (this.seenSpeech.size >= 40) { this.fault('Local call turn limit reached. Start a new call.'); return; }
     this.seenSpeech.add(itemId);
     this.turn = { id: itemId, number: ++this.turnNumber };
+    if (this.outputMode === 'gated') this.hooks.browser({ type: 'input-speech', state: 'started', itemId, turn: this.turn.number });
     this.epoch++;
     this.inputAbort?.abort();
     this.clearDeadline('transcription');
@@ -95,6 +99,7 @@ export class GuardrailEngine {
         if (this.turn?.id !== event.item_id) break;
         this.clearDeadline('speech');
         this.turn.stoppedAt = this.now();
+        if (this.outputMode === 'gated') this.hooks.browser({ type: 'input-speech', state: 'stopped', itemId: event.item_id, turn: this.turn.number });
         this.emit({ kind: 'lifecycle', name: 'Speech ended; awaiting transcription' });
         if (!this.turn.transcript) this.deadline('transcription', 12000, 'Input transcription unavailable after 12 seconds. No response was authorized.');
         break;
@@ -121,6 +126,9 @@ export class GuardrailEngine {
         break;
       case 'response.done':
         this.responseDone(event); break;
+      case 'response.output_audio.delta':
+      case 'response.output_audio.done':
+        this.audioEvent(event); break;
       case 'output_audio_buffer.started':
         if (this.active?.id !== event.response_id) break;
         this.active.playbackStopped = false;
@@ -226,7 +234,7 @@ export class GuardrailEngine {
     const pending = this.pending;
     if (!pending || pending.id !== requestId || pending.stage !== 'creating' || this.active) {
       this.send({ type: 'response.cancel', response_id: id });
-      this.send({ type: 'output_audio_buffer.clear' });
+      if (this.outputMode === 'monitor') this.send({ type: 'output_audio_buffer.clear' });
       this.fault('Unexpected or automatic response. Call stopped before any further authorization.');
       return;
     }
@@ -235,10 +243,32 @@ export class GuardrailEngine {
     this.active = {
       id, turn: pending.turn, recovery: !!pending.recoveryText, parts: new Map(), items: new Set(), deleted: new Set(),
       revision: 0, checked: -1, offered: '', done: false, playbackStopped: false, playbackStarted: false, interrupted: false, cleared: false, muted: false, clearRequested: false,
+      requestId: pending.id, audio: new PcmResponseBuffer(), audioSealed: false, finalChecked: false, releaseSent: false, localStarted: false,
     };
     this.deadline('generation', 45000, 'Response generation/playback lifecycle exceeded 45 seconds.');
     this.emit({ kind: 'lifecycle', name: 'Response started', responseId: id });
+    if (this.outputMode === 'gated') {
+      this.hooks.browser({ type: 'audio-start', responseId: id, requestId: pending.id, turn: pending.turn });
+      this.emit({ kind: 'lifecycle', name: 'Output held; collecting native audio and checking text', delivery: 'held', responseId: id });
+    }
     if (pending.stale || pending.turn !== this.turn?.number) this.interrupt('Superseded response creation');
+  }
+
+  private audioEvent(event: Extract<RealtimeEvent, { type: 'response.output_audio.delta' | 'response.output_audio.done' }>) {
+    const active = this.active;
+    if (this.outputMode !== 'gated' || !active || active.id !== event.response_id || active.interrupted) return;
+    const part: AudioPartId = { itemId: event.item_id, outputIndex: event.output_index, contentIndex: event.content_index };
+    try {
+      if (active.done) throw new Error('Audio arrived after generation completion.');
+      active.items.add(part.itemId);
+      if (event.type === 'response.output_audio.delta') {
+        active.audio.append(part, decodePcm(event.delta));
+        this.hooks.browser({ type: 'audio-chunk', responseId: active.id, part, data: event.delta });
+      } else {
+        active.audio.finishPart(part);
+        this.hooks.browser({ type: 'audio-part-done', responseId: active.id, part });
+      }
+    } catch { this.fault('Native output audio was malformed, incomplete or exceeded the 30-second buffer. Nothing was released.'); }
   }
 
   private updatePart(itemId: string, output: number, content: number, text: string, final: boolean) {
@@ -246,7 +276,7 @@ export class GuardrailEngine {
     if (!active) return;
     const key = `${itemId}:${content}`;
     const prior = active.parts.get(key);
-    if (prior?.final) return;
+    if (prior?.final && (!final || prior.text === text)) return;
     const nextText = final ? text : (prior?.text ?? '') + text;
     active.parts.set(key, { output, content, text: nextText, final });
     if (nextText !== prior?.text) active.revision++;
@@ -267,13 +297,14 @@ export class GuardrailEngine {
   private snapshot(final: boolean) {
     const active = this.active;
     if (!active || active.interrupted || this.disposed || !this.text().trim()) return;
-    const key = `${active.revision}:${final || active.done}`;
+    const isFinal = this.outputMode === 'gated' ? active.done : final || active.done;
+    const key = `${active.revision}:${isFinal}`;
     if (active.offered === key || (!final && active.offered.startsWith(`${active.revision}:`))) return;
     active.offered = key;
     this.scheduler.offer({
-      phase: 'output', text: this.text(), final: final || active.done, recentContext: [...this.context],
+      phase: 'output', text: this.text(), final: isFinal, recentContext: [...this.context],
       responseId: active.id, revision: active.revision, turn: active.turn,
-    }, final || active.done);
+    }, isFinal);
   }
   private outputVerdict(snapshot: Snapshot, verdict: Verdict) {
     const active = this.active;
@@ -288,6 +319,7 @@ export class GuardrailEngine {
       return;
     }
     active.checked = Math.max(active.checked, snapshot.revision);
+    if (snapshot.final && active.done && snapshot.revision === active.revision) active.finalChecked = true;
     this.finishResponse();
   }
 
@@ -306,6 +338,25 @@ export class GuardrailEngine {
     }
     this.emit({ kind: 'lifecycle', name: 'Generation ended; final checks/playback may still be pending', responseId: active.id });
     if (!active.interrupted && !this.text().trim()) { this.fault('Response ended without an output transcript.'); return; }
+    if (this.outputMode === 'gated' && !active.interrupted && !active.audioSealed) {
+      try {
+        const summaries = active.audio.summaries();
+        const expected = (event.response.output ?? []).flatMap((item, outputIndex) =>
+          (item.content ?? []).flatMap((part, contentIndex) => ['audio', 'output_audio'].includes(part.type)
+            ? [{ itemId: item.id, outputIndex, contentIndex }] : []));
+        if (!expected.length || expected.length !== summaries.length || expected.some(id => {
+          const transcript = active.parts.get(`${id.itemId}:${id.contentIndex}`);
+          return !summaries.some(part => audioPartKey(part) === audioPartKey(id))
+            || !transcript?.final || !transcript.text.trim() || transcript.output !== id.outputIndex;
+        })) throw new Error('Audio parts do not match complete final transcripts.');
+        active.audio.seal(summaries);
+        active.audioSealed = true;
+        active.audio.discard();
+        this.hooks.browser({ type: 'audio-complete', responseId: active.id, requestId: active.requestId,
+          turn: active.turn, revision: active.revision, parts: summaries });
+        this.emit({ kind: 'lifecycle', name: 'Native audio fully delivered; final transcript ready; awaiting final gate', responseId: active.id, delivery: 'held' });
+      } catch { this.fault('Native response ended without complete matching audio. Buffered output discarded.'); return; }
+    }
     if (active.interrupted) this.clearInterruptedOutput();
     else this.snapshot(true);
     this.finishResponse();
@@ -315,12 +366,13 @@ export class GuardrailEngine {
     const active = this.active;
     if (!active || active.interrupted) return;
     active.interrupted = true;
+    active.audio.discard();
     active.recoveryText = recoveryText;
     active.actionId = randomUUID();
     this.scheduler.reset();
     this.clearDeadline('output-transcript');
     this.hooks.browser({ type: 'mute', actionId: active.actionId, responseId: active.id, turn: active.turn });
-    this.emit({ kind: 'interrupt', name: reason, responseId: active.id });
+    this.emit({ kind: 'interrupt', name: reason, responseId: active.id, ...(this.outputMode === 'gated' ? { delivery: 'blocked' as const } : {}) });
     if (!active.done) {
       active.cancelId = randomUUID();
       this.send({ type: 'response.cancel', response_id: active.id, event_id: active.cancelId });
@@ -333,7 +385,7 @@ export class GuardrailEngine {
     if (!active?.interrupted || !active.done || active.clearRequested) return;
     // Clearing before generation ends can let in-flight audio refill the buffer.
     active.clearRequested = true;
-    this.send({ type: 'output_audio_buffer.clear' });
+    if (this.outputMode === 'monitor') this.send({ type: 'output_audio_buffer.clear' });
     active.items.forEach(id => this.deleteItem(id));
   }
   private deleteItem(id: string) {
@@ -349,14 +401,45 @@ export class GuardrailEngine {
     this.emit({ kind: 'metric', name: 'Browser command-receipt to mute (not network transit)', durationMs, responseId: this.active.id });
     this.finishResponse();
   }
+  localPlayback(responseId: string, requestId: string, state: 'started' | 'ended') {
+    const active = this.active;
+    if (this.disposed || this.outputMode !== 'gated' || !active || active.id !== responseId
+      || active.requestId !== requestId || active.interrupted || active.turn !== this.turn?.number) return;
+    if (!active.releaseSent || (state === 'ended' && !active.localStarted)) {
+      this.fault('Unapproved local playback acknowledgment. Buffered speech stopped.'); return;
+    }
+    if (state === 'started') {
+      if (active.localStarted) return;
+      active.localStarted = true;
+      this.clearDeadline('local-playback-start');
+      this.deadline('local-playback', (MAX_OUTPUT_SECONDS + 5) * 1000, 'Local audio playback did not finish; call stopped.');
+      this.emit({ kind: 'lifecycle', name: 'Approved local playback started', responseId, delivery: 'playing' });
+    } else {
+      active.playbackStopped = true;
+      this.clearDeadline('local-playback');
+      this.emit({ kind: 'lifecycle', name: 'Approved local playback ended', responseId, delivery: 'ended' });
+      this.finishResponse();
+    }
+  }
   private finishResponse() {
     const active = this.active;
     if (!active || !active.done) return;
     if (active.interrupted) {
-      if (!active.cleared || !active.muted || [...active.items].some(id => !active.deleted.has(id))) return;
+      if ((this.outputMode === 'monitor' && !active.cleared) || !active.muted || [...active.items].some(id => !active.deleted.has(id))) return;
       active.items.forEach(id => this.clearDeadline(`delete:${id}`));
       this.clearDeadline('cleanup');
     } else {
+      if (this.outputMode === 'gated') {
+        if (!active.audioSealed || !active.finalChecked) return;
+        if (!active.releaseSent) {
+          active.releaseSent = true;
+          this.clearDeadline('generation');
+          this.deadline('local-playback-start', 5000, 'Approved local audio did not start; call stopped.');
+          this.emit({ kind: 'lifecycle', name: 'Final output allowed; releasing complete native audio', responseId: active.id, revision: active.revision, delivery: 'approved' });
+          this.hooks.browser({ type: 'audio-release', responseId: active.id, requestId: active.requestId, turn: active.turn, revision: active.revision });
+          return;
+        }
+      }
       if (!active.playbackStopped || active.checked !== active.revision) return;
       this.context.push({ role: 'assistant', text: this.text() });
       this.context = this.context.slice(-8);
@@ -364,6 +447,8 @@ export class GuardrailEngine {
       this.approvedRefs = this.approvedRefs.slice(-8);
     }
     this.clearDeadline('generation');
+    this.clearDeadline('local-playback-start');
+    this.clearDeadline('local-playback');
     this.clearDeadline('output-transcript');
     this.scheduler.reset();
     this.active = undefined;
@@ -383,6 +468,7 @@ export class GuardrailEngine {
   close() {
     if (this.disposed) return;
     this.disposed = true;
+    this.active?.audio.discard();
     this.epoch++;
     this.inputAbort?.abort();
     this.scheduler.reset();

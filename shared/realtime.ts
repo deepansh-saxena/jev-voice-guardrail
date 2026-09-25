@@ -31,6 +31,8 @@ export const realtimeSchema = z.discriminatedUnion('type', [
   z.object({ ...base, type: z.literal('response.output_item.added'), response_id: id, output_index: z.number(), item }),
   z.object({ ...transcript, type: z.literal('response.output_audio_transcript.delta'), delta: z.string().max(16000) }),
   z.object({ ...transcript, type: z.literal('response.output_audio_transcript.done'), transcript: z.string().max(16000) }),
+  z.object({ ...transcript, type: z.literal('response.output_audio.delta'), delta: z.string().min(4).max(256000) }),
+  z.object({ ...transcript, type: z.literal('response.output_audio.done') }),
   z.object({ ...base, type: z.literal('output_audio_buffer.started'), response_id: id }),
   z.object({ ...base, type: z.literal('output_audio_buffer.stopped'), response_id: id }),
   z.object({ ...base, type: z.literal('output_audio_buffer.cleared'), response_id: id }),

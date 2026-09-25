@@ -52,9 +52,10 @@ test('stopping a fixture removes pending events and unlocks configuration', asyn
   await page.clock.install();
   await page.getByRole('button', { name: 'Play fixture' }).click();
   await page.getByRole('button', { name: 'Stop session' }).click();
+  const messagesAtStop = await page.locator('.message').allTextContents();
   await page.clock.runFor(4200);
   await expect(page.getByRole('button', { name: 'Stress test', exact: true })).toBeEnabled();
-  await expect(page.locator('.message')).toHaveCount(0);
+  expect(await page.locator('.message').allTextContents()).toEqual(messagesAtStop);
 });
 
 test('runs replay through the API and keeps fixture results out of provider latency panels', async ({ page }) => {
@@ -93,7 +94,8 @@ test('all sections remain navigable on mobile without horizontal overflow', asyn
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test('synthetic microphone tracks stop after a control transport failure', async ({ page }) => {
+for (const outputMode of ['monitor', 'gated'] as const) {
+test(`${outputMode}: synthetic microphone tracks stop after a control transport failure`, async ({ page }) => {
   await page.addInitScript(() => {
     const tracks: MediaStreamTrack[] = [];
     Object.defineProperty(window, 'relayTestTracks', { value: tracks });
@@ -115,6 +117,7 @@ test('synthetic microphone tracks stop after a control transport failure', async
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Live', exact: true }).click();
+  await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption(outputMode);
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect(page.getByRole('alert')).toContainText('Test control transport unavailable.');
   expect(await page.evaluate(() => {
@@ -124,7 +127,7 @@ test('synthetic microphone tracks stop after a control transport failure', async
   await page.evaluate(() => (Reflect.get(window, 'relayTestAudioContext') as AudioContext).close());
 });
 
-test('late microphone permission resolution cannot leak a track after Stop', async ({ page }) => {
+test(`${outputMode}: late microphone permission resolution cannot leak a track after Stop`, async ({ page }) => {
   await page.addInitScript(() => {
     const context = new AudioContext();
     const stream = context.createMediaStreamDestination().stream;
@@ -144,6 +147,7 @@ test('late microphone permission resolution cannot leak a track after Stop', asy
   });
   await page.goto('/');
   await page.getByRole('button', { name: 'Live', exact: true }).click();
+  await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption(outputMode);
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect.poll(() => page.evaluate(() => typeof Reflect.get(window, 'relayGrantMedia'))).toBe('function');
   await page.getByRole('button', { name: 'Stop session' }).click();
@@ -151,4 +155,22 @@ test('late microphone permission resolution cannot leak a track after Stop', asy
   await expect.poll(() => page.evaluate(() => (Reflect.get(window, 'relayTestTracks') as MediaStreamTrack[]).every(t => t.readyState === 'ended'))).toBe(true);
   await page.evaluate(() => (Reflect.get(window, 'relayTestAudioContext') as AudioContext).close());
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+}
+
+test('gated stress fixture clearly labels simulated pre-playback blocks through recovery', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
+  await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption('gated');
+  await page.getByRole('button', { name: 'Stress test', exact: true }).click();
+  await page.clock.install();
+  await page.getByRole('button', { name: 'Play fixture' }).click();
+  await expect(page.getByLabel('OUTPUT DELIVERY', { exact: true })).toBeDisabled();
+  await page.clock.runFor(4300);
+  const history = page.getByRole('region', { name: 'Guardrail incident history' });
+  await expect(history.getByText('SIMULATED OUTPUT BLOCKED BEFORE PLAYBACK', { exact: true })).toBeVisible();
+  await expect(history).toContainText('1 output blocked before playback');
+  await expect(history).toContainText('0 simulated streaming interruptions');
+  await expect(history).toContainText('Simulated approved recovery playback; no real audio');
+  await expect(page.getByLabel('OUTPUT DELIVERY', { exact: true })).toBeEnabled();
 });
