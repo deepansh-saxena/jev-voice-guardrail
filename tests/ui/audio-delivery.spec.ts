@@ -1,5 +1,5 @@
 import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
-import type { ServerMessage } from '../../shared/protocol';
+import type { ClientMessage, ServerMessage } from '../../shared/protocol';
 
 interface SinkProbe {
   contexts: AudioContext[];
@@ -9,6 +9,7 @@ interface SinkProbe {
   peak: number;
   timer: number;
   renderers: HTMLMediaElement[];
+  gains: GainNode[];
 }
 const identity = { responseId: 'response1', requestId: 'request1', turn: 1 };
 const part = { itemId: 'assistant1', outputIndex: 0, contentIndex: 0 };
@@ -38,7 +39,7 @@ test.beforeEach(async ({ page }) => {
     config: { intervalMs: 200, timeoutMs: 4000 },
   } }));
   await page.addInitScript(() => {
-    const state: SinkProbe = { contexts: [], analysers: [], tracks: [], starts: [], peak: 0, timer: 0, renderers: [] };
+    const state: SinkProbe = { contexts: [], analysers: [], tracks: [], starts: [], peak: 0, timer: 0, renderers: [], gains: [] };
     Reflect.set(window, 'sinkProbe', state);
     const NativeContext = AudioContext;
     window.AudioContext = class extends NativeContext {
@@ -46,6 +47,7 @@ test.beforeEach(async ({ page }) => {
     };
     const connect = AudioNode.prototype.connect;
     Object.defineProperty(AudioNode.prototype, 'connect', { value: function (this: AudioNode, destination: AudioNode | AudioParam, ...ports: number[]) {
+      if (this instanceof GainNode && destination instanceof AnalyserNode) state.gains.push(this);
       if (destination instanceof AudioDestinationNode) {
         const analyser = this.context.createAnalyser();
         analyser.fftSize = 256;
@@ -192,7 +194,7 @@ test('Stop during worklet setup closes capture and cannot start a late relay', a
 
 async function monitorTransport(page: Page) {
   let socket!: WebSocketRoute;
-  const received: { type: string; requestId?: string }[] = [];
+  const received: ClientMessage[] = [];
   await page.addInitScript(() => {
     const NativePeer = RTCPeerConnection;
     Reflect.set(window, 'testNativePeer', NativePeer);
@@ -203,7 +205,7 @@ async function monitorTransport(page: Page) {
   await page.routeWebSocket('**/ws', ws => {
     socket = ws;
     ws.onMessage(async raw => {
-      const message = JSON.parse(String(raw));
+      const message: ClientMessage = JSON.parse(String(raw));
       if (message.type !== 'audio-input') received.push(message);
       if (message.type === 'connect-gated') ws.send(JSON.stringify({ type: 'ready' }));
       if (message.type !== 'connect') return;
@@ -230,7 +232,9 @@ async function monitorTransport(page: Page) {
         await context.resume();
         const destination = context.createMediaStreamDestination();
         const oscillator = context.createOscillator();
-        oscillator.connect(destination); oscillator.start();
+        const remoteGain = context.createGain();
+        oscillator.connect(remoteGain); remoteGain.connect(destination); oscillator.start();
+        Reflect.set(window, 'remoteSyntheticGain', remoteGain);
         destination.stream.getTracks().forEach(t => peer.addTrack(t, destination.stream));
         peer.ondatachannel = e => Reflect.set(window, 'testRemoteChannel', e.channel);
         await peer.setRemoteDescription(client.localDescription ?? { type: 'offer', sdp: offer });
@@ -338,3 +342,25 @@ test('blocked browser media playback fails closed with an actionable sound-permi
   expect(await peak(page)).toBe(0);
   expect(await page.evaluate(() => (Reflect.get(window, 'sinkProbe') as SinkProbe).tracks.every(t => t.readyState === 'ended'))).toBe(true);
 });
+
+  test('assistant pause detector uses decoded acoustic frames upstream of muted playback gain', async ({ page }) => {
+    const h = await monitorTransport(page);
+    await page.goto('/');
+    await page.getByLabel('USER INPUT SILENCE (MS)').fill('900');
+    await page.getByLabel('OUTPUT CHECK TIMING').selectOption('pauses');
+    await page.getByLabel('ASSISTANT PAUSE (MS)').fill('200');
+    await page.getByRole('button', { name: 'Start microphone' }).click();
+    await monitorTurn(page, h, 1);
+    await expect.poll(() => peak(page)).toBeGreaterThan(0.05);
+    await expect(page.getByLabel('OUTPUT CHECK TIMING')).toBeDisabled();
+    await expect(page.getByLabel('USER INPUT SILENCE (MS)')).toBeDisabled();
+    expect(h.received.find(e => e.type === 'connect')).toMatchObject({ settings: { inputSilenceMs: 900, outputCadence: 'pauses', assistantPauseMs: 200 } });
+    await page.evaluate(() => { (Reflect.get(window, 'sinkProbe') as SinkProbe).gains.forEach(g => { g.gain.value = 0; }); });
+    await page.waitForTimeout(250);
+    await page.evaluate(() => { (Reflect.get(window, 'remoteSyntheticGain') as GainNode).gain.value = 0; });
+    await expect.poll(() => h.received.filter(e => e.type === 'assistant-pause').length).toBe(1);
+    expect(h.received.find(e => e.type === 'assistant-pause')).toMatchObject({ responseId: 'response1', requestId: 'req1', turn: 1, sequence: 1 });
+    await page.waitForTimeout(350);
+    expect(h.received.filter(e => e.type === 'assistant-pause')).toHaveLength(1);
+    await page.getByRole('button', { name: 'Stop session' }).click();
+  });

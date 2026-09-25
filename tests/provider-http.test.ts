@@ -9,6 +9,7 @@ describe('provider HTTP integration with in-process mocked responses', () => {
     vi.stubEnv('LLM_API_KEY', 'fixture-llm-key-not-real');
     vi.stubEnv('LLM_BASE_URL', 'https://example.invalid/openai/v1');
     vi.stubEnv('LLM_MODEL', 'separate-judge-deployment');
+    vi.stubEnv('LLM_AUTH', 'bearer');
   });
   afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
   it('sends the official SDK Jev bearer Authorization header, atomic questions and pinned version', async () => {

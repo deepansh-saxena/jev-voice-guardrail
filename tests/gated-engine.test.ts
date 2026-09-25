@@ -3,6 +3,7 @@ import { GuardrailEngine } from '../server/engine';
 import { phasePolicies, type Phase } from '../shared/policies';
 import type { Decision, JudgeInput, ServerMessage, Verdict } from '../shared/protocol';
 import type { Judge } from '../server/judges';
+import { defaultSessionSettings, type SessionSettings } from '../shared/session-settings';
 
 function verdict(phase: Phase, decision: Decision = 'allow'): Verdict {
   return { decision, provider: 'llm', model: 'test', source: 'live', serviceMs: 1,
@@ -13,10 +14,10 @@ function deferred<T>() {
   const promise = new Promise<T>(r => { resolve = r; });
   return { promise, resolve };
 }
-function harness(judge: Judge = async input => verdict(input.phase)) {
+function harness(judge: Judge = async input => verdict(input.phase), settings: SessionSettings = defaultSessionSettings) {
   const browser: ServerMessage[] = [];
   const provider: Record<string, unknown>[] = [];
-  const engine = new GuardrailEngine(judge, { browser: e => browser.push(e), provider: e => provider.push(e) }, 1000, 'gated');
+  const engine = new GuardrailEngine(judge, { browser: e => browser.push(e), provider: e => provider.push(e)   }, 1000, 'gated', settings);
   const arm = () => browser.filter((e): e is Extract<ServerMessage, { type: 'arm' }> => e.type === 'arm').at(-1)!;
   const user = (id = 'u1') => {
     engine.receive({ type: 'input_audio_buffer.speech_started', item_id: id });
@@ -51,6 +52,33 @@ function harness(judge: Judge = async input => verdict(input.phase)) {
 describe('whole-response native output gate', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  it('checks acoustic pauses in held PCM but cannot release until its separate final allow', async () => {
+    const seen: JudgeInput[] = [];
+    const h = harness(async input => { seen.push(input); return verdict(input.phase); }, { ...defaultSessionSettings, outputCadence: 'pauses' });
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.response(); h.text();
+    const pcm = Buffer.alloc(14400 * 2);
+    for (let i = 0; i < 2400; i++) pcm.writeInt16LE(4000, i * 2);
+    const fields = { response_id: 'r1', item_id: 'a-r1', output_index: 0, content_index: 0 };
+    h.engine.receive({ type: 'response.output_audio.delta', ...fields, delta: pcm.toString('base64') });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen.at(-1)).toMatchObject({ phase: 'output', final: false });
+    expect(h.released()).toHaveLength(0);
+    h.engine.receive({ type: 'response.output_audio.done', ...fields });
+    h.finish(); await vi.advanceTimersByTimeAsync(0);
+    expect(seen.at(-1)).toMatchObject({ final: true });
+    expect(h.released()).toHaveLength(1);
+    h.engine.close();
+  });
+  it('complete-only never judges partial held text and flushes final even with no acoustic pause', async () => {
+    const seen: JudgeInput[] = [];
+    const h = harness(async input => { seen.push(input); return verdict(input.phase); }, { ...defaultSessionSettings, outputCadence: 'complete' });
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.response(); h.text(); h.audio();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(seen).toHaveLength(1); expect(h.released()).toHaveLength(0);
+    h.finish(); await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toHaveLength(2); expect(seen[1].final).toBe(true); expect(h.released()).toHaveLength(1);
+    h.engine.close();
+  });
   it('requires completed audio, normal generation and the exact final allow before releasing once', async () => {
     const final = deferred<Verdict>();
     const h = harness(async input => input.phase === 'output' && input.final ? final.promise : verdict(input.phase));

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { z } from 'zod';
 import { CHECK_INTERVAL_MS, KB_VERSION, POLICY_VERSION } from '../shared/policies';
 import type { Readiness } from '../shared/protocol';
+import { referencePricing } from '../shared/judge-cost';
 
 const empty = (v: unknown) => v === '' ? undefined : v;
 const optional = z.preprocess(empty, z.string().min(1).optional());
@@ -45,6 +46,7 @@ export function readiness(): Readiness {
   const jevMissing = missing(['JEV_API_KEY']);
   const llmMissing = missing(['LLM_BASE_URL', 'LLM_MODEL', 'LLM_API_KEY']);
   return {
+    pricing: referencePricing(env.JEV_MODEL, env.LLM_MODEL ?? ''),
     azure: { configured: !azureMissing.length, missing: azureMissing, transport: 'Azure GA WebRTC + server sideband', deployment: azureDeployment },
     jev: { configured: !jevMissing.length, missing: jevMissing, model: env.JEV_MODEL },
     llm: { configured: !llmMissing.length, missing: llmMissing, model: env.LLM_MODEL ?? 'Not configured', reasoning: env.LLM_REASONING_EFFORT ?? 'omitted (model default)' },

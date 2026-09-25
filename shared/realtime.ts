@@ -18,7 +18,7 @@ const response = z.object({
 export const realtimeSchema = z.discriminatedUnion('type', [
   z.object({ ...base, type: z.literal('session.updated'), session: z.object({
     audio: z.object({ input: z.object({
-      turn_detection: z.object({ create_response: z.boolean(), interrupt_response: z.boolean() }),
+      turn_detection: z.object({ create_response: z.boolean(), interrupt_response: z.boolean(), silence_duration_ms: z.number().int().optional() }),
       transcription: z.object({ model: z.string() }),
     }) }),
   }) }),

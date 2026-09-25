@@ -4,8 +4,10 @@ import { agentInstructions, type AgentMode } from '../shared/policies';
 import { parseRealtime, type RealtimeEvent } from '../shared/realtime';
 import { azureDeployment, azureUrl, env, readiness } from './config';
 import { bounded, GuardrailError } from './async';
+import { defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
 
-export function sessionConfig(mode: AgentMode) {
+export function sessionConfig(mode: AgentMode, settings: SessionSettings = defaultSessionSettings) {
+  const { inputSilenceMs } = sessionSettingsSchema.parse(settings);
   return {
     type: 'realtime', model: azureDeployment,
     instructions: agentInstructions(mode),
@@ -15,7 +17,7 @@ export function sessionConfig(mode: AgentMode) {
     audio: {
       input: {
         transcription: { model: env.AZURE_TRANSCRIPTION_DEPLOYMENT, language: 'en' },
-        turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 500, create_response: false, interrupt_response: false },
+        turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: inputSilenceMs, create_response: false, interrupt_response: false },
       },
       output: { voice: env.AZURE_VOICE },
     },
@@ -30,11 +32,12 @@ export interface AzureConnection {
 export async function connectAzure(
   sdp: string, mode: AgentMode, signal: AbortSignal,
   onEvent: (event: RealtimeEvent) => void, onFailure: (message: string) => void,
+  settings: SessionSettings = defaultSessionSettings,
 ): Promise<AzureConnection> {
   if (!readiness().azure.configured)
     throw new GuardrailError('config', `Missing configuration: ${readiness().azure.missing.join(', ')}.`);
   const base = `${azureUrl.origin}/openai/v1/realtime`;
-  const configuration = sessionConfig(mode);
+  const configuration = sessionConfig(mode, settings);
   const answer = await bounded(async innerSignal => {
     const tokenResponse = await fetch(`${base}/client_secrets`, {
       method: 'POST', headers: { 'api-key': env.AZURE_OPENAI_API_KEY!, 'Content-Type': 'application/json' },
@@ -95,6 +98,7 @@ export async function connectAzure(
           if (event.type === 'session.updated') {
             const input = event.session.audio.input;
             if (input.turn_detection.create_response || input.turn_detection.interrupt_response
+              || input.turn_detection.silence_duration_ms !== settings.inputSilenceMs
               || input.transcription.model !== env.AZURE_TRANSCRIPTION_DEPLOYMENT) {
               throw new GuardrailError('azure-gates', 'Azure did not confirm the required input gates and transcription configuration.');
             }

@@ -6,11 +6,13 @@ import { bounded, GuardrailError } from './async';
 import { parseRealtime, type RealtimeEvent } from '../shared/realtime';
 import type { AgentMode } from '../shared/policies';
 import { PCM_SAMPLE_RATE } from '../shared/audio';
+import { defaultSessionSettings, type SessionSettings } from '../shared/session-settings';
 
 export type GatedAzureConnection = Omit<AzureConnection, 'answer'>;
 export async function connectGatedAzure(
   mode: AgentMode, signal: AbortSignal,
   onEvent: (event: RealtimeEvent) => void, onFailure: (message: string) => void,
+  settings: SessionSettings = defaultSessionSettings,
 ): Promise<GatedAzureConnection> {
   if (!readiness().azure.configured) throw new GuardrailError('config', 'Native voice and same-resource transcription configuration are required.');
   const url = new URL(azureUrl);
@@ -25,7 +27,7 @@ export async function connectGatedAzure(
     else if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
   };
   signal.addEventListener('abort', close, { once: true });
-  const { model: _model, ...session } = sessionConfig(mode);
+  const { model: _model, ...session } = sessionConfig(mode, settings);
   const format = { type: 'audio/pcm', rate: PCM_SAMPLE_RATE };
   try {
     await bounded(() => new Promise<void>((resolve, reject) => {
@@ -49,6 +51,7 @@ export async function connectGatedAzure(
             z.object({ session: z.object({ audio: z.object({ input: z.object({ format: pcm }), output: z.object({ format: pcm }) }) }) }).parse(value);
             const input = event.session.audio.input;
             if (input.turn_detection.create_response || input.turn_detection.interrupt_response
+              || input.turn_detection.silence_duration_ms !== settings.inputSilenceMs
               || input.transcription.model !== env.AZURE_TRANSCRIPTION_DEPLOYMENT)
               throw new Error('Native PCM gates not confirmed.');
             configured = true;

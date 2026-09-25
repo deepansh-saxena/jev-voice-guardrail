@@ -3,6 +3,8 @@ import { judgeInstructions, knowledge, MAX_TEXT, phasePolicies } from '../shared
 import { aggregate, contextSchema, decisionSchema, type JudgeInput, type Provider, type PolicyDecision, type Verdict, type Source } from '../shared/protocol';
 import { env, readiness } from './config';
 import { GuardrailError } from './async';
+import { randomUUID } from 'node:crypto';
+import { estimateUsd, referencePricing, reportedUsage, type JudgeUsage, type Pricing } from '../shared/judge-cost';
 
 export type Judge = (input: JudgeInput, signal: AbortSignal) => Promise<Verdict>;
 const probability = z.number().finite().min(0).max(1);
@@ -104,32 +106,54 @@ async function jsonRequest(url: string, headers: Record<string, string>, body: u
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-export function createJudge(provider: Provider, source: Source = 'live'): Judge {
+export function createJudge(provider: Provider, source: Source = 'live', accounting?: (usage: JudgeUsage) => void,
+  pricing: Pricing = referencePricing(env.JEV_MODEL, env.LLM_MODEL ?? '')): Judge {
   const state = readiness()[provider];
   if (!state.configured) throw new GuardrailError('config', `Missing configuration: ${state.missing.join(', ')}.`);
   return async (input, signal) => {
+    if (signal.aborted) throw new GuardrailError('aborted', 'Guardrail request canceled before HTTP attempt.');
+    const payload = provider === 'jev' ? jevBody(input, env.JEV_MODEL)
+      : llmBody(input, env.LLM_MODEL!, env.LLM_REASONING_EFFORT, env.LLM_MAX_COMPLETION_TOKENS);
     const start = performance.now();
     starts[provider] = starts[provider].filter(t => t > start - 60000);
     if (active[provider] >= 2 || starts[provider].length >= env.JUDGE_MAX_REQUESTS_PER_MINUTE)
       throw new GuardrailError('capacity', 'Guardrail unavailable: local concurrency or per-minute limit reached.');
     starts[provider].push(start);
     active[provider]++;
+    const record: JudgeUsage = {
+      callId: randomUUID(), provider, phase: input.phase, model: provider === 'jev' ? env.JEV_MODEL : env.LLM_MODEL!,
+      status: 'pending', usage: null, rates: pricing[provider] ? { ...pricing[provider] } : null, estimatedUsd: null,
+    };
+    const report = () => {
+      try { accounting?.({ ...record }); }
+      catch { console.error('Judge accounting delivery failed; cost coverage is incomplete.'); }
+    };
+    report();
     try {
       let normalized: ReturnType<typeof parseLlm>;
+      let data: unknown;
       if (provider === 'jev') {
-        const data = await jsonRequest('https://api.typesafe.ai/v1/systemone',
-          { Authorization: `Bearer ${env.JEV_API_KEY!}`, 'Content-Type': 'application/json' }, jevBody(input, env.JEV_MODEL), signal);
-        normalized = parseJev(data, input, env.JEV_MIN_PROBABILITY);
+        data = await jsonRequest('https://api.typesafe.ai/v1/systemone',
+          { Authorization: `Bearer ${env.JEV_API_KEY!}`, 'Content-Type': 'application/json' },           payload, signal);
       } else {
         const auth: Record<string, string> = env.LLM_AUTH === 'api-key' ? { 'api-key': env.LLM_API_KEY! } : { Authorization: `Bearer ${env.LLM_API_KEY!}` };
-        const data = await jsonRequest(`${env.LLM_BASE_URL!.replace(/\/$/, '')}/chat/completions`,
-          { ...auth, 'Content-Type': 'application/json' }, llmBody(input, env.LLM_MODEL!, env.LLM_REASONING_EFFORT, env.LLM_MAX_COMPLETION_TOKENS), signal);
-        normalized = parseLlm(data, input);
+        data = await jsonRequest(`${env.LLM_BASE_URL!.replace(/\/$/, '')}/chat/completions`,
+          { ...auth, 'Content-Type': 'application/json' }, payload, signal);
       }
+      record.usage = reportedUsage(provider, data);
+      record.status = record.usage ? 'reported' : 'unavailable';
+      record.estimatedUsd = estimateUsd(record.usage, record.rates);
+      record.warning = !record.usage ? 'Provider token usage missing or invalid.' : record.estimatedUsd === null ? 'Pricing or cache accounting incomplete.' : undefined;
+      normalized = provider === 'jev' ? parseJev(data, input, env.JEV_MIN_PROBABILITY) : parseLlm(data, input);
+      record.model = normalized.model;
       return { ...normalized, decision: aggregate(normalized.policies), provider, source, serviceMs: performance.now() - start };
     } catch (error) {
       if (error instanceof GuardrailError) throw error;
       throw new GuardrailError('malformed', 'Guardrail unavailable: malformed, refused, incomplete or unreadable provider result.');
-    } finally { active[provider]--; }
+    } finally {
+      if (record.status === 'pending') { record.status = 'unavailable'; record.warning = 'Request ended without reported usage; it may still be billed.'; }
+      report();
+      active[provider]--;
+    }
   };
 }

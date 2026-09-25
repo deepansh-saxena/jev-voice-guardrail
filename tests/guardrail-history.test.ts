@@ -113,15 +113,7 @@ describe('current-session guardrail evidence', () => {
     expect(timelineLabel(input, history)).toContain('Customer privacy');
     expect(timelineLabel(input, history)).not.toContain('Product scope');
   });
-  it('labels fixtures explicitly simulated and resets all history for a new session', () => {
-    const history = historyOf([
-      check('output', ['roadmap'], { source: 'fixture', clock: 'fixture', responseId: 'f1' }),
-      event({ kind: 'interrupt', source: 'fixture', clock: 'fixture', responseId: 'f1', name: 'Simulated detect and interrupt; no real audio played' }),
-    ]);
-    expect(incidentLabel(history.incidents[0])).toBe('SIMULATED OUTPUT INTERRUPTED');
-    expect(incidentDetail(history.incidents[0])).toContain('no real audio');
-    expect(incidentCounts(emptyHistory())).toEqual({ inputBlocks: 0, outputViolations: 0, gatedOutputBlocks: 0, outputInterruptions: 0 });
-  });
+
   it('counts gated violations as unheard blocks, never streaming interruptions', () => {
     const history = historyOf([check('output', ['roadmap', 'discount'], { responseId: 'g1', outputMode: 'gated' }),
       event({ kind: 'interrupt', name: 'Output violation: roadmap', responseId: 'g1', outputMode: 'gated' }),

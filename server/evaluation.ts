@@ -1,21 +1,25 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { cases, CORPUS_VERSION, fixtureVerdict, type EvalCase, type Snapshot } from '../shared/cases';
+import { cases, CORPUS_VERSION, type EvalCase, type Snapshot } from '../shared/cases';
 import { CHECK_INTERVAL_MS } from '../shared/policies';
 import type { Decision, JudgeInput, Provider, Verdict } from '../shared/protocol';
 import { distribution } from '../shared/metrics';
 import { CoalescingScheduler, errorMessage, GuardrailError } from './async';
 import { createJudge, type Judge } from './judges';
 import { env, publicRunConfig } from './config';
+import { referencePricing, retainUsage, type JudgeUsage, type Pricing } from '../shared/judge-cost';
 
 export interface EvalRow {
-  caseId: string; split: string; phase: 'input' | 'output'; provider: Provider | 'fixture';
+  caseId: string; split: string; phase: 'input' | 'output'; provider: Provider;
   snapshotAtMs: number; text: string; expected: Snapshot['expected']; verdict?: Verdict; error?: string;
   finalSnapshot: boolean;
   checkStartedOffsetMs: number | null; verdictOffsetMs: number | null;
 }
 export interface EvalResult {
-  id: string; createdAt: string; source: 'fixture' | 'provider-replay';
+  id: string; createdAt: string; source: 'provider-replay';
+  usage?: JudgeUsage[]; pricing?: Pricing;
+  status?: 'completed' | 'canceled' | 'failed';
+  error?: string;
   corpusVersion: string; groundTruth: string; config: ReturnType<typeof publicRunConfig>;
   rows: EvalRow[]; summaries: ReturnType<typeof summarize>[]; file: string;
 }
@@ -58,15 +62,15 @@ export async function replayCase(
       caseId: test.id, split: test.split, phase: test.phase, provider,
       snapshotAtMs: job.snapshot.atMs, text: job.snapshot.text, expected: job.snapshot.expected, verdict,
       finalSnapshot: job.input.final,
-      checkStartedOffsetMs: provider === 'fixture' ? null : offsets.get(job)!,
-      verdictOffsetMs: provider === 'fixture' ? null : performance.now() - start,
+      checkStartedOffsetMs: offsets.get(job)!,
+      verdictOffsetMs: performance.now() - start,
     }),
     (job, error) => rows.push({
       caseId: test.id, split: test.split, phase: test.phase, provider,
       snapshotAtMs: job.snapshot.atMs, text: job.snapshot.text, expected: job.snapshot.expected,
       finalSnapshot: job.input.final,
-      error: errorMessage(error), checkStartedOffsetMs: provider === 'fixture' ? null : offsets.get(job) ?? null,
-      verdictOffsetMs: provider === 'fixture' ? null : performance.now() - start,
+      error: errorMessage(error), checkStartedOffsetMs: offsets.get(job) ?? null,
+      verdictOffsetMs: performance.now() - start,
     }), CHECK_INTERVAL_MS, timeoutMs,
   );
   const abort = () => scheduler.reset();
@@ -87,43 +91,47 @@ export async function replayCase(
   } finally { scheduler.reset(); signal.removeEventListener('abort', abort); }
 }
 export async function evaluate(
-  source: 'fixture' | 'provider-replay', split: 'tuning' | 'held-out' | 'all', caseIds: string[] | undefined, signal: AbortSignal,
+  source: 'provider-replay', split: 'tuning' | 'held-out' | 'all', caseIds: string[] | undefined, signal: AbortSignal,
+  pricing: Pricing = referencePricing(env.JEV_MODEL, env.LLM_MODEL ?? ''),
 ): Promise<EvalResult> {
   if (caseIds?.some(id => !cases.some(c => c.id === id))) throw new GuardrailError('cases', 'Unknown evaluation case ID.');
   const selected = cases.filter(c => (split === 'all' || c.split === split) && (!caseIds || caseIds.includes(c.id)));
   if (!selected.length) throw new GuardrailError('cases', 'No evaluation cases match the selection.');
-  const providers: (Provider | 'fixture')[] = source === 'fixture' ? ['fixture'] : ['jev', 'llm'];
-  const judges = providers.map(provider => provider === 'fixture' ? null : createJudge(provider, 'provider-replay'));
+  const providers: Provider[] = ['jev', 'llm'];
+  let usage: Record<string, JudgeUsage> = {};
+  const judges = providers.map(provider => createJudge(provider, 'provider-replay', record => { usage = retainUsage(usage, record); }, pricing));
   // Each provider receives the same independent stream. Detection never truncates its peer's evidence.
-  const batches = await Promise.all(providers.map(async (provider, i) => {
-    const rows: EvalRow[] = [];
+  const batches: EvalRow[][] = providers.map(() => []);
+  const outcomes = await Promise.allSettled(providers.map(async (provider, i) => {
+    const rows = batches[i];
     for (const test of selected) {
-      const judge: Judge = judges[i] ?? (async input => {
-        const match = test.snapshots.find(s => s.text === input.text);
-        if (!match) throw new GuardrailError('fixture-missing', 'No authored fixture exists for this snapshot.');
-        return fixtureVerdict(match);
-      });
+      const judge = judges[i];
       rows.push(...await replayCase(test, judge, provider, signal));
     }
-    return rows;
   }));
   const rows = batches.flat();
   const id = randomUUID();
   const file = `results/eval-${id}.json`;
   const result: EvalResult = {
     id, createdAt: new Date().toISOString(), source, corpusVersion: CORPUS_VERSION,
-    groundTruth: 'Synthetic labels authored for review; not independently human-validated. Fixture oracle is not accuracy evidence.',
-    config: publicRunConfig(), rows, summaries: providers.map(p => summarize(rows, p)), file,
+    groundTruth: 'Synthetic text labels authored for review; not independently human-validated or recorded audio.',
+    config: publicRunConfig(), usage: Object.values(usage).map(record => record.status === 'pending'
+      ? { ...record, status: 'unavailable', warning: 'Run ended before usage arrived; request may still be billed.' } : record),
+    pricing, rows, summaries: providers.map(p => summarize(rows, p)), file,
+    status: signal.aborted ? 'canceled' : outcomes.some(o => o.status === 'rejected') ? 'failed' : 'completed',
+    error: outcomes.flatMap(o => o.status === 'rejected' ? [errorMessage(o.reason)] : [])[0],
   };
   await mkdir('results', { recursive: true, mode: 0o700 });
   await writeFile(file, JSON.stringify(result, null, 2), { mode: 0o600 });
-  if (source === 'provider-replay')
-    await writeFile('results/latest-provider-replay.json', JSON.stringify(result, null, 2), { mode: 0o600 });
+  await writeFile('results/latest-provider-replay.json', JSON.stringify(result, null, 2), { mode: 0o600 });
   return result;
 }
 
 export async function latestProviderReplay(): Promise<unknown> {
-  try { return JSON.parse(await readFile('results/latest-provider-replay.json', 'utf8')); }
+  try {
+    const result = JSON.parse(await readFile('results/latest-provider-replay.json', 'utf8'));
+    return result.source === 'provider-replay' ? result : null;
+  }
   catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
     throw new GuardrailError('result-read', 'The latest local provider replay report is unreadable.');

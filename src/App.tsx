@@ -5,13 +5,16 @@ import { CHECK_INTERVAL_MS, KB_VERSION, knowledge, phasePolicies, policies, POLI
 import { distribution } from '../shared/metrics';
 import { transportFor, type LabEvent, type OutputMode, type Provider, type Readiness } from '../shared/protocol';
 import type { EvalResult } from '../server/evaluation';
-import { examples, playFixture } from './fixture';
+import { examples } from '../shared/policies';
+import { referencePricing, retainUsage, type JudgeUsage, type Pricing } from '../shared/judge-cost';
+import { JudgeCost, PricingSettings } from './judge-cost';
 import { LiveCall } from './live';
 import { GatedLiveCall } from './gated-live';
+import { cadenceDescription, defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
 import { appendHistory, emptyHistory, incidentCounts, incidentDetail, incidentLabel, inputCheckFor, inputTextFor, outputPauseFor, outputPauseLabel, policyNames, timelineLabel } from './guardrail-history';
 
 const ms = (n: number | null | undefined) => n == null ? '--' : `${Math.round(n)} ms`;
-const providerName = (p: string) => p === 'jev' ? 'Jev' : p === 'llm' ? 'LLM judge' : 'Fixture oracle';
+const providerName = (p: string) => p === 'jev' ? 'Jev' : p === 'llm' ? 'LLM judge' : 'Unknown judge';
 
 function Badge({ children, tone = 'neutral' }: { children: React.ReactNode; tone?: string }) {
   return <span className={`badge ${tone}`}>{children}</span>;
@@ -30,10 +33,14 @@ function download(data: unknown, name: string) {
 
 export default function App() {
   const [tab, setTab] = useState<'lab' | 'replay' | 'knowledge'>('lab');
-  const [source, setSource] = useState<'fixture' | 'live'>('live');
+  const source = 'live';
   const [provider, setProvider] = useState<Provider>('jev');
   const [mode, setMode] = useState<AgentMode>('normal');
   const [outputMode, setOutputMode] = useState<OutputMode>('monitor');
+  const [settings, setSettings] = useState<SessionSettings>(defaultSessionSettings);
+  const [pricing, setPricing] = useState<Pricing>(() => referencePricing('jev-1.13.0', ''));
+  const [sessionPricing, setSessionPricing] = useState<Pricing>();
+  const [usage, setUsage] = useState<Record<string, JudgeUsage>>({});
   const [example, setExample] = useState('roadmap');
   const [ready, setReady] = useState<Readiness>();
   const [events, setEvents] = useState<LabEvent[]>([]);
@@ -51,18 +58,23 @@ export default function App() {
   const emit = (event: LabEvent) => {
     setEvents(previous => [...previous.slice(-599), event]);
     setHistory(previous => appendHistory(previous, event));
+    if (event.usage) setUsage(previous => retainUsage(previous, event.usage!));
   };
-  const resetSession = () => { setEvents([]); setHistory(emptyHistory()); setError(undefined); };
+  const resetSession = () => { setEvents([]); setHistory(emptyHistory()); setError(undefined); setUsage({}); };
+  const updateSettings = (change: Partial<SessionSettings>) => { setSettings(previous => ({ ...previous, ...change })); resetSession(); };
+  const settingsValid = sessionSettingsSchema.safeParse(settings).success;
   useEffect(() => {
     const controller = new AbortController();
     fetch('/api/readiness', { signal: controller.signal }).then(async res => {
       if (!res.ok) throw new Error('Cannot read local provider readiness.');
-      setReady(await res.json());
+      const data: Readiness = await res.json();
+      setReady(data);
+      setPricing(data.pricing ?? referencePricing(data.jev.model, data.llm.model));
     }).catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Local API unavailable.'); });
     fetch('/api/evaluations/latest', { signal: controller.signal }).then(async res => {
       if (!res.ok) throw new Error('Cannot read the latest local replay report.');
       const data: EvalResult | null = await res.json();
-      if (data) setResult(data);
+      if (data?.source === 'provider-replay') setResult(data);
     }).catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Latest replay report unavailable.'); });
     return () => { controller.abort(); stopRef.current?.(); evalAbort.current?.abort(); };
   }, []);
@@ -85,29 +97,34 @@ export default function App() {
   const shownStatus = active ? (events.findLast(e => e.kind === 'status' || e.kind === 'lifecycle')?.name ?? status) : status;
   const stop = () => { stopRef.current?.(); stopRef.current = undefined; setActive(false); setStatus('Stopped'); };
   const start = () => {
+    if (!settingsValid) { setError('Timing values must be whole milliseconds from 100 to 2000.'); return; }
     resetSession(); setError(undefined); setActive(true);
-    if (source === 'fixture') {
-      setStatus('Playing authored events');
-      stopRef.current = playFixture(example, mode, emit, () => { setActive(false); setStatus('Fixture complete'); stopRef.current = undefined; }, outputMode);
-    } else {
+    setSessionPricing(pricing);
+    {
       const Call = outputMode === 'gated' ? GatedLiveCall : LiveCall;
       const call = new Call({ event: emit, status: setStatus, error: message => { setError(message); setActive(false); } });
       stopRef.current = () => call.stop();
-      void call.start(provider, mode);
+      void call.start(provider, mode, settings, pricing);
     }
   };
-  const runEval = async (evalSource: 'fixture' | 'provider-replay') => {
+  const runEval = async () => {
     const controller = new AbortController();
     evalAbort.current = controller;
     setEvaluating(true); setError(undefined); setResult(undefined);
     try {
       const response = await fetch('/api/evaluate', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: evalSource, split }), signal: controller.signal });
+        body: JSON.stringify({ source: 'provider-replay', split, pricing }), signal: controller.signal });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? 'Evaluation failed.');
       setResult(data);
     } catch (e) { setError(controller.signal.aborted ? 'Evaluation canceled.' : e instanceof Error ? e.message : 'Evaluation failed.'); }
     finally { setEvaluating(false); evalAbort.current = undefined; }
+  };
+  const cancelEval = async () => {
+    try {
+      const response = await fetch('/api/evaluations/cancel', { method: 'POST' });
+      if (!response.ok) throw new Error('Cannot cancel the provider replay.');
+    } catch { setError('Cannot cancel replay through the local API. Stop the server if needed.'); }
   };
   return <div className="app-shell">
     <aside className="sidebar">
@@ -134,34 +151,43 @@ export default function App() {
         <div className="page-heading">
           <div><div className="eyebrow">RELAY GUARDRAIL LAB</div><h1>{tab === 'lab' ? <>Voice, with boundaries<span>.</span></> : tab === 'replay' ? <>Same evidence. Honest comparison<span>.</span></> : <>Context is part of the test<span>.</span></>}</h1>
             <p>{tab === 'lab' ? 'A hands-on lab for input gates, gated speech and live output interruption.' : tab === 'replay' ? 'Replay authored transcript snapshots independently through both judges.' : 'Versioned operating policies, grounded in a fully synthetic product.'}</p></div>
-          <Badge tone={source === 'fixture' ? 'amber' : 'green'}><FlaskConical size={13} />{source === 'fixture' ? 'Fixture mode' : 'Live providers'}</Badge>
+          <Badge tone={'green'}><FlaskConical size={13} />{'Live providers'}</Badge>
         </div>
         {error && <div className="error-banner" role="alert"><TriangleAlert size={19} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError(undefined)}><X size={16} /></button></div>}
+        <PricingSettings value={pricing} change={setPricing} disabled={busy} models={{ jev: ready?.jev.model ?? '', llm: ready?.llm.model ?? '' }} />
         {tab === 'lab' && <>
-          {source === 'live' && !liveReady && <section className="live-setup card">
+          {!liveReady && <section className="live-setup card">
             <div className="live-setup-icon"><Mic size={22} /></div>
             <div><h2>{ready ? 'Live voice is not ready yet' : 'Checking live voice setup'}</h2><p>{ready
               ? 'Add the remaining configuration below to the backend .env and restart the API. The microphone stays off until the input guardrail can run.'
               : 'Reading the local backend configuration. No microphone has been requested.'}</p>
               <div className="missing-settings">{missingLive.map(key => <code key={key}>{key}</code>)}</div>
               {missingLive.includes('AZURE_TRANSCRIPTION_DEPLOYMENT') && <p>Use an existing transcription deployment name on the same Azure resource as Realtime. A realtime deployment name is not a transcription deployment.</p>}
-              <button className="text-button" disabled={busy} onClick={() => { setSource('fixture'); resetSession(); }}>Explore a simulated fixture instead <ArrowRight size={13} /></button></div>
+              </div>
           </section>}
-          <div className="mode-banner"><FlaskConical size={18} /><div><strong>{source === 'fixture' ? 'Explore without credentials.' : 'Native Azure speech-to-speech.'}</strong> {source === 'fixture' ? 'Authored text and event playback. No microphone, recordings, model predictions or measured provider latency.' : outputMode === 'gated' ? 'Input stays gated. Native output stays inaudible until the whole response receives a final allow.' : 'Input gates response creation, not audio ingestion. Output is detect-and-interrupt, not zero leakage.'}</div><button onClick={() => setTab('replay')}>About the evidence <ArrowRight size={14} /></button></div>
+          <div className="mode-banner"><FlaskConical size={18} /><div><strong>{'Native Azure speech-to-speech.'}</strong> {outputMode === 'gated' ? 'Input stays gated. Native output stays inaudible until the whole response receives a final allow.' : 'Input gates response creation, not audio ingestion. Output is detect-and-interrupt, not zero leakage.'}</div><button onClick={() => setTab('replay')}>About the evidence <ArrowRight size={14} /></button></div>
           <section className="configuration card" aria-label="Session configuration">
-            <div className="config-field"><label>SESSION SOURCE</label><div className="segmented"><button disabled={busy} className={source === 'fixture' ? 'chosen' : ''} onClick={() => { setSource('fixture'); resetSession(); }}><FlaskConical size={14} />Fixture</button><button disabled={busy} className={source === 'live' ? 'chosen' : ''} onClick={() => { setSource('live'); resetSession(); }}><Radio size={14} />Live</button></div></div>
-            <div className="config-field"><label htmlFor="judge">ENFORCING JUDGE</label><select id="judge" disabled={busy || source === 'fixture'} value={provider} onChange={e => setProvider(e.target.value as Provider)}>{source === 'fixture' ? <option value={provider}>Authored fixture oracle</option> : <><option value="jev">Jev · TypeSafe</option><option value="llm">Structured-output LLM</option></>}</select></div>
+
+            <div className="config-field"><label htmlFor="judge">ENFORCING JUDGE</label><select id="judge" disabled={busy || false} value={provider} onChange={e => setProvider(e.target.value as Provider)}>{<><option value="jev">Jev · TypeSafe</option><option value="llm">Structured-output LLM</option></>}</select></div>
             <div className="config-field agent-config"><label>VOICE CONFIGURATION</label><div className="segmented"><button disabled={busy} className={mode === 'normal' ? 'chosen' : ''} onClick={() => setMode('normal')}>Normal agent</button><button disabled={busy} className={mode === 'stress' ? 'chosen stress' : ''} onClick={() => setMode('stress')}>Stress test</button></div></div>
           </section>
           <section className="card delivery-options" aria-label="Output delivery configuration">
             <div><label htmlFor="output-delivery">OUTPUT DELIVERY</label><select id="output-delivery" disabled={busy} value={outputMode} onChange={e => { setOutputMode(e.target.value as OutputMode); resetSession(); }}><option value="monitor">Monitor while speaking</option><option value="gated">Gate before speaking</option></select></div>
-            <p>{outputMode === 'gated' ? 'Wait for the complete native response and final guardrail approval, then play from the beginning. Maximum 30 seconds of audio; rejected audio is discarded.' : 'Play native audio as it arrives while guardrails check it. Some speech can be heard before detection and interruption.'}<small>Transport: {source === 'fixture' ? 'simulated; no media transport' : outputMode === 'gated' ? 'Azure native WebSocket PCM via local relay' : 'Azure direct WebRTC + server sideband'}. Both modes screen input and output. Cross-mode timing includes the relay difference, not just gating or judge speed.</small></p>
+            <p>{outputMode === 'gated' ? 'Wait for the complete native response and final guardrail approval, then play from the beginning. Maximum 30 seconds of audio; rejected audio is discarded.' : 'Play native audio as it arrives while guardrails check it. Some speech can be heard before detection and interruption.'}<small>Transport: {outputMode === 'gated' ? 'Azure native WebSocket PCM via local relay' : 'Azure direct WebRTC + server sideband'}. Both modes screen input and output. Cross-mode timing includes the relay difference, not just gating or judge speed.</small></p>
           </section>
+          <section className="configuration card timing-options" aria-label="Per-session timing">
+            <div className="config-field"><label htmlFor="input-silence">USER INPUT SILENCE (MS)</label><input id="input-silence" type="number" min={100} max={2000} step={1} disabled={busy} value={Number.isFinite(settings.inputSilenceMs) ? settings.inputSilenceMs : ''} onChange={e => updateSettings({ inputSilenceMs: e.currentTarget.valueAsNumber })} /><small>Azure user-turn silence, not a semantic sentence end. Input judgment stays required.</small></div>
+            <div className="config-field"><label htmlFor="output-cadence">OUTPUT CHECK TIMING</label><select id="output-cadence" disabled={busy} value={settings.outputCadence} onChange={e => updateSettings({ outputCadence: e.target.value as SessionSettings['outputCadence'] })}><option value="periodic">Periodic</option><option value="pauses">Assistant speech pauses</option><option value="complete">Complete response only</option></select><small>Every option includes a final full-response check. Separate from output delivery.</small></div>
+            {settings.outputCadence === 'periodic' && <div className="config-field"><label htmlFor="output-interval">PERIODIC INTERVAL (MS)</label><input id="output-interval" type="number" min={100} max={2000} step={1} disabled={busy} value={Number.isFinite(settings.outputIntervalMs) ? settings.outputIntervalMs : ''} onChange={e => updateSettings({ outputIntervalMs: e.currentTarget.valueAsNumber })} /></div>}
+            {settings.outputCadence === 'pauses' && <div className="config-field"><label htmlFor="assistant-pause">ASSISTANT PAUSE (MS)</label><input id="assistant-pause" type="number" min={100} max={2000} step={1} disabled={busy} value={Number.isFinite(settings.assistantPauseMs) ? settings.assistantPauseMs : ''} onChange={e => updateSettings({ assistantPauseMs: e.currentTarget.valueAsNumber })} /><small>Acoustic silence, not punctuation or user VAD. Transcript timing is approximate.</small></div>}
+          </section>
+          {!settingsValid && <p className="error-text" role="status">Timing values must be whole milliseconds from 100 to 2000.</p>}
+          {settings.outputCadence !== 'periodic' && <p className="muted-note">{settings.outputCadence === 'complete' ? outputMode === 'monitor' ? 'Checks wait for generation to finish. You may hear the entire answer before a verdict.' : 'Only the complete response is judged. All audio still waits for final approval.' : 'Checks follow detected assistant audio pauses or normal generation completion. Detection can be later than periodic checks; silence is not sentence alignment.'}</p>}
           {mode === 'stress' && <div className="stress-note"><TriangleAlert size={15} />Synthetic output restrictions are enforced externally only. Same knowledge, unchanged input gates. Not representative of normal model failure rates.</div>}
           <section className={`card incident-panel ${history.incidents.length ? 'has-incidents' : ''}`} aria-label="Guardrail incident history" aria-live="polite">
-            <div className="section-header"><h2><ShieldCheck size={17} />Guardrail activity</h2><Badge tone={history.incidents.length ? 'red' : 'neutral'}>{source === 'fixture' ? 'Simulated session history' : 'Current session history'}</Badge></div>
-            <p className="incident-summary">{counts.inputBlocks} input blocked turns · {counts.gatedOutputBlocks} output blocked before playback · {counts.outputInterruptions} {source === 'fixture' ? 'simulated' : 'confirmed'} streaming interruptions · {counts.outputViolations} output violation responses</p>
-            {outputMode === 'gated' && latestDelivery && <div className={`gate-delivery ${latestDelivery.delivery}`} role="status"><strong>{source === 'fixture' ? 'SIMULATED ' : ''}{latestDelivery.delivery === 'held' ? 'OUTPUT HELD / CHECKING' : latestDelivery.delivery === 'approved' ? 'OUTPUT APPROVED' : latestDelivery.delivery === 'playing' ? 'APPROVED OUTPUT PLAYING' : latestDelivery.delivery === 'ended' ? 'LOCAL PLAYBACK ENDED' : 'HELD OUTPUT DISCARDED'}</strong><p>{latestDelivery.name}</p></div>}
+            <div className="section-header"><h2><ShieldCheck size={17} />Guardrail activity</h2><Badge tone={history.incidents.length ? 'red' : 'neutral'}>{'Current session history'}</Badge></div>
+            <p className="incident-summary">{counts.inputBlocks} input blocked turns · {counts.gatedOutputBlocks} output blocked before playback · {counts.outputInterruptions} {'confirmed'} streaming interruptions · {counts.outputViolations} output violation responses</p>
+            {outputMode === 'gated' && latestDelivery && <div className={`gate-delivery ${latestDelivery.delivery}`} role="status"><strong>{''}{latestDelivery.delivery === 'held' ? 'OUTPUT HELD / CHECKING' : latestDelivery.delivery === 'approved' ? 'OUTPUT APPROVED' : latestDelivery.delivery === 'playing' ? 'APPROVED OUTPUT PLAYING' : latestDelivery.delivery === 'ended' ? 'LOCAL PLAYBACK ENDED' : 'HELD OUTPUT DISCARDED'}</strong><p>{latestDelivery.name}</p></div>}
             {!history.incidents.length && <p className="incident-empty">No policy violations recorded. Clarifications, user barge-in and technical errors are not policy violations.</p>}
             {!!history.incidents.length && <ol className="incident-list">{[...history.incidents].reverse().map(incident => {
               const input = inputTextFor(history, incident.first);
@@ -169,44 +195,44 @@ export default function App() {
                 <div className="incident-heading"><strong>{incidentLabel(incident)}</strong><span>{policyNames(incident.policies)}</span></div>
                 <p>{incidentDetail(incident)}</p>
                 <blockquote>{input ? `“${input.length > 240 ? `${input.slice(0, 240)}...` : input}”` : `Input turn ${incident.first.turn ?? 'unavailable'}; transcript not available in this view.`}</blockquote>
-                <small>Turn {incident.first.turn ?? '--'} · {(incident.first.atMs / 1000).toFixed(2)}s {incident.first.clock} clock · {providerName(incident.first.verdict?.provider ?? '')} · {incident.first.source === 'fixture' ? 'Authored timing, not measured' : `${ms(incident.first.verdict?.serviceMs)} judge decision`}</small>
+                <small>Turn {incident.first.turn ?? '--'} · {(incident.first.atMs / 1000).toFixed(2)}s {incident.first.clock} clock · {providerName(incident.first.verdict?.provider ?? '')} · {`${ms(incident.first.verdict?.serviceMs)} judge decision`}</small>
               </li>;
             })}</ol>}
-            {!!clarifications.length && <div className="clarification-history" aria-label="Input clarification history">{[...clarifications].reverse().map(event => <div key={event.id} className="clarification-notice"><strong>{source === 'fixture' ? 'SIMULATED ' : ''}NEEDS CLARIFICATION</strong><span>Turn {event.turn ?? '--'} · {inputTextFor(history, event) ?? 'Input transcript unavailable'} · {providerName(event.verdict?.provider ?? '')} · {ms(event.verdict?.serviceMs)}</span><p>Uncertain input, not a confirmed policy violation. A clarification may follow.</p></div>)}</div>}
+            {!!clarifications.length && <div className="clarification-history" aria-label="Input clarification history">{[...clarifications].reverse().map(event => <div key={event.id} className="clarification-notice"><strong>{''}NEEDS CLARIFICATION</strong><span>Turn {event.turn ?? '--'} · {inputTextFor(history, event) ?? 'Input transcript unavailable'} · {providerName(event.verdict?.provider ?? '')} · {ms(event.verdict?.serviceMs)}</span><p>Uncertain input, not a confirmed policy violation. A clarification may follow.</p></div>)}</div>}
             {history.latestError && <div className="unavailable-notice"><strong>GUARDRAIL UNAVAILABLE</strong><p>{history.latestError.name}</p><small>Technical/session failure; not counted as a policy violation.</small></div>}
             <p className="incident-foot">Safe redirects and later passes do not erase this history. It resets when a new session starts or the source changes.</p>
           </section>
           <div className="lab-grid">
             <div className="lab-primary">
               <section className="voice-stage">
-                <div className="stage-top"><Badge tone="dark"><span className={active ? 'pulse-dot' : 'idle-dot'} />{source === 'fixture' ? 'SYNTHETIC EVENT STREAM' : outputMode === 'gated' ? 'NATIVE PCM RELAY · GATED' : 'NATIVE WEBRTC AUDIO'}</Badge><Headphones size={18} /></div>
-                <div className="stage-center"><div className="voice-symbol"><AudioLines size={25} /></div><h2>{active ? (source === 'fixture' ? 'Watching the boundaries' : 'Relay is listening') : source === 'live' && !liveReady ? 'Finish live voice setup' : 'Meet your Relay assistant'}</h2><p>{source === 'fixture' ? 'See how a conversation moves through the guardrails.' : 'Ask about plans, billing or support. Headphones recommended.'}</p><Waveform active={active} /></div>
-                <div className="stage-bottom"><div className="stage-status"><span className={active ? 'pulse-dot' : 'idle-dot'} /><span>{source === 'live' && !liveReady ? 'Setup required · microphone off' : shownStatus}</span></div>
-                  <button className={`primary-button ${active ? 'stop-button' : ''}`} disabled={!active && (evaluating || (source === 'live' && !liveReady))} onClick={active ? stop : start}>{active ? <Square size={15} fill="currentColor" /> : source === 'fixture' ? <Play size={16} fill="currentColor" /> : <Mic size={17} />}{active ? 'Stop session' : source === 'fixture' ? 'Play fixture' : 'Start microphone'}</button></div>
+                <div className="stage-top"><Badge tone="dark"><span className={active ? 'pulse-dot' : 'idle-dot'} />{outputMode === 'gated' ? 'NATIVE PCM RELAY · GATED' : 'NATIVE WEBRTC AUDIO'}</Badge><Headphones size={18} /></div>
+                <div className="stage-center"><div className="voice-symbol"><AudioLines size={25} /></div><h2>{active ? ('Relay is listening') : !liveReady ? 'Finish live voice setup' : 'Meet your Relay assistant'}</h2><p>{'Ask about plans, billing or support. Headphones recommended.'}</p><Waveform active={active} /></div>
+                <div className="stage-bottom"><div className="stage-status"><span className={active ? 'pulse-dot' : 'idle-dot'} /><span>{!liveReady ? 'Setup required · microphone off' : shownStatus}</span></div>
+                  <button className={`primary-button ${active ? 'stop-button' : ''}`} disabled={!active && (!settingsValid || evaluating || (!liveReady))} onClick={active ? stop : start}>{active ? <Square size={15} fill="currentColor" /> : <Mic size={17} />}{active ? 'Stop session' : 'Start microphone'}</button></div>
               </section>
 
-              <section className="card conversation"><div className="section-header"><h2><AudioLines size={17} />Conversation</h2><Badge>{source === 'fixture' ? 'Authored text' : 'Generated transcript'}</Badge></div>
+              <section className="card conversation"><div className="section-header"><h2><AudioLines size={17} />Conversation</h2><Badge>{'Generated transcript'}</Badge></div>
                 <div className="messages" aria-live="polite">
-                  {!transcripts.size ? <div className="empty-conversation"><div className="empty-icon"><Mic size={23} /></div><strong>A little conversation. A lot of visibility.</strong><p>Pick an example below, then {source === 'fixture' ? 'play the fixture' : 'start your microphone'}.</p></div> : [...transcripts.values()].map(event => {
+                  {!transcripts.size ? <div className="empty-conversation"><div className="empty-icon"><Mic size={23} /></div><strong>A little conversation. A lot of visibility.</strong><p>Pick an example below, then {'start your microphone'}.</p></div> : [...transcripts.values()].map(event => {
                     const checked = event.role === 'user' ? inputCheckFor(history, event) : undefined;
                     const audioPause = event.role === 'assistant' ? outputPauseFor(history, event) : undefined;
                     const decision = checked?.verdict?.decision;
                     const flagged = checked?.verdict?.policies.filter(p => p.decision === decision && p.decision !== 'allow').map(p => p.policy) ?? [];
                     return <div className={`message ${event.role}`} key={event.id}>
-                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : source === 'fixture' ? 'Synthetic · not spoken' : 'Monitored · not audio-aligned'}</span></div><p>{event.text}</p>
-                      {decision && <div className="message-guardrail"><Badge tone={decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'green'}>{source === 'fixture' ? 'SIMULATED ' : ''}{decision === 'violate' ? 'INPUT BLOCKED' : decision === 'uncertain' ? 'NEEDS CLARIFICATION' : 'INPUT ALLOWED'}{flagged.length ? `: ${policyNames(flagged)}` : ''}</Badge>{decision === 'violate' && <small>Original answer blocked before generation.</small>}</div>}
-                      {audioPause && <div className="message-guardrail"><Badge tone={audioPause.verdict?.decision === 'violate' ? 'red' : 'amber'}>{source === 'fixture' ? 'SIMULATED ' : ''}{outputPauseLabel(audioPause)}</Badge><small>Generated text is not proof of heard audio. A separate recovery may follow.</small></div>}
+                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : 'Monitored · not audio-aligned'}</span></div><p>{event.text}</p>
+                      {decision && <div className="message-guardrail"><Badge tone={decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'green'}>{''}{decision === 'violate' ? 'INPUT BLOCKED' : decision === 'uncertain' ? 'NEEDS CLARIFICATION' : 'INPUT ALLOWED'}{flagged.length ? `: ${policyNames(flagged)}` : ''}</Badge>{decision === 'violate' && <small>Original answer blocked before generation.</small>}</div>}
+                      {audioPause && <div className="message-guardrail"><Badge tone={audioPause.verdict?.decision === 'violate' ? 'red' : 'amber'}>{''}{outputPauseLabel(audioPause)}</Badge><small>Generated text is not proof of heard audio. A separate recovery may follow.</small></div>}
                     </div></div>;
                   })}
                   <div ref={eventEnd} />
                 </div>
                 <div className="conversation-foot"><CircleHelp size={13} />Assistant text can include generated words that were never heard.</div>
               </section>
-              <section className="examples"><div className="section-header"><h2>Try a conversation</h2><span>Authored scenarios</span></div><div className="example-grid">{examples.map(item => <button key={item.id} disabled={busy} className={`example ${example === item.id ? 'picked' : ''}`} onClick={() => setExample(item.id)}><span>{item.category}<ArrowRight size={13} /></span><strong>{item.title}</strong><p>“{item.text}”</p></button>)}</div>{source === 'live' && <p className="muted-note">Examples are speaking prompts; selecting one does not inject text or trigger a response.</p>}</section>
+              <section className="examples"><div className="section-header"><h2>Try a conversation</h2><span>Authored scenarios</span></div><div className="example-grid">{examples.map(item => <button key={item.id} disabled={busy} className={`example ${example === item.id ? 'picked' : ''}`} onClick={() => setExample(item.id)}><span>{item.category}<ArrowRight size={13} /></span><strong>{item.title}</strong><p>“{item.text}”</p></button>)}</div>{<p className="muted-note">Examples are speaking prompts; selecting one does not inject text or trigger a response.</p>}</section>
             </div>
             <div className="lab-secondary">
               <section className="card policy-panel"><div className="section-header"><h2><ShieldCheck size={17} />Guardrail monitor</h2><span>Latest checks only</span></div>
-                {(['input', 'output'] as const).map(phase => <div className="policy-group" key={phase}><div className="group-heading"><span className={`direction ${phase}`}>{phase === 'input' ? 'IN' : 'OUT'}</span><div><strong>{phase === 'input' ? 'Before the response' : outputMode === 'gated' ? 'Before local playback' : 'While audio plays'}</strong><small>{phase === 'input' ? 'Allow, redirect or clarify' : outputMode === 'gated' ? 'Complete final allow required' : `New-text checks every ${CHECK_INTERVAL_MS} ms`}</small></div></div>
+                {(['input', 'output'] as const).map(phase => <div className="policy-group" key={phase}><div className="group-heading"><span className={`direction ${phase}`}>{phase === 'input' ? 'IN' : 'OUT'}</span><div><strong>{phase === 'input' ? 'Before the response' : outputMode === 'gated' ? 'Before local playback' : 'While audio plays'}</strong><small>{phase === 'input' ? 'Allow, redirect or clarify' : cadenceDescription(settings)}</small></div></div>
                   {phasePolicies(phase).map(policy => {
                     const decision = (phase === 'input' ? inputCheck : outputCheck)?.verdict?.policies.find(p => p.policy === policy.id)?.decision;
                     return <div className="policy-row" key={policy.id}><span>{policy.name}</span><Badge tone={decision === 'allow' ? 'green' : decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'neutral'}>{decision === 'allow' ? <Check size={11} /> : decision === 'violate' ? <Square size={8} fill="currentColor" /> : null}{decision === 'allow' && phase === 'output' ? 'Clear so far' : decision ?? 'Waiting'}</Badge></div>;
@@ -217,22 +243,25 @@ export default function App() {
                 {(['azure', 'jev', 'llm'] as const).map(key => <div className="provider-row" key={key}><span className={`provider-icon ${key}`}>{key === 'azure' ? 'A' : key === 'jev' ? 'J' : 'L'}</span><div><strong>{key === 'azure' ? 'Azure Realtime' : providerName(key)}</strong><small>{ready?.[key].configured ? 'Configuration present' : 'Configuration incomplete'}</small>{ready?.verification?.[key] && <small className="verification-note" title={ready.verification[key].checkedAt}>Prior check: {ready.verification[key].summary}</small>}</div><span className={`readiness-dot ${ready?.[key].configured ? 'is-ready' : ''}`} /></div>)}
                 <details><summary>Required local configuration <ChevronRight size={13} /></summary><p>Edit <code>.env</code> and restart the API. Keys stay on the server.</p>{ready && [...ready.azure.missing, ...ready.jev.missing, ...ready.llm.missing].map(name => <code className="env-name" key={name}>{name}</code>)}<p>No automatic mock-provider fallback.</p></details>
               </section>
-              <section className="principle"><div><Activity size={17} /><strong>Observe, don’t overclaim.</strong></div><p>{outputMode === 'gated' ? 'Whole-response buffering adds waiting. Semantic judgments can still be wrong; browser playback controls are cooperative, not tamper-proof.' : 'No intentional pre-playback buffer. Some speech may be heard before a violation is detected.'} Fixture timings are not benchmarks.</p></section>
+              <section className="principle"><div><Activity size={17} /><strong>Observe, don’t overclaim.</strong></div><p>{outputMode === 'gated' ? 'Whole-response buffering adds waiting. Semantic judgments can still be wrong; browser playback controls are cooperative, not tamper-proof.' : 'No intentional pre-playback buffer. Some speech may be heard before a violation is detected.'}               Judge and audio timings are different measurements.</p></section>
             </div>
           </div>
-          <section className="metric-strip card"><div className="metric"><span>INPUT JUDGE</span><strong>{ms(inputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(inputMetrics.p95)} · n={inputMetrics.count}</p></div><div className="metric"><span>OUTPUT JUDGE</span><strong>{ms(outputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(outputMetrics.p95)} · n={outputMetrics.count}</p></div><div className="metric"><span>SPEECH END → AUDIO ENERGY</span><strong>{ms(audioMetrics.p50)}<small>p50</small></strong><p>Output sink estimate · not hardware-audible time</p></div><div className="metric" aria-label="Input blocked turns"><span>{source === 'fixture' ? 'SIMULATED INPUT BLOCKS' : 'INPUT BLOCKED TURNS'}</span><strong>{counts.inputBlocks}</strong><p>One count per turn, not per policy</p></div><div className="metric" aria-label={outputMode === 'gated' ? 'Output blocked responses' : 'Output interruptions'}><span>{source === 'fixture' ? 'SIMULATED ' : ''}{outputMode === 'gated' ? 'OUTPUT BLOCKED BEFORE PLAYBACK' : 'OUTPUT INTERRUPTIONS'}</span><strong>{outputMode === 'gated' ? counts.gatedOutputBlocks : counts.outputInterruptions}</strong><p>{counts.outputViolations} violation responses · {source === 'fixture' ? 'No measured provider samples' : outputMode === 'gated' ? 'Rejected held responses; not speech interruptions' : 'Requires browser mute during provider playback; not hardware silence'}</p></div></section>
+          <section className="metric-strip card"><div className="metric"><span>INPUT JUDGE</span><strong>{ms(inputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(inputMetrics.p95)} · n={inputMetrics.count}</p></div><div className="metric"><span>OUTPUT JUDGE</span><strong>{ms(outputMetrics.p50)}<small>p50</small></strong><p>p95 {ms(outputMetrics.p95)} · n={outputMetrics.count}</p></div><div className="metric"><span>SPEECH END → AUDIO ENERGY</span><strong>{ms(audioMetrics.p50)}<small>p50</small></strong><p>Output sink estimate · not hardware-audible time</p></div><div className="metric" aria-label="Input blocked turns"><span>{'INPUT BLOCKED TURNS'}</span><strong>{counts.inputBlocks}</strong><p>One count per turn, not per policy</p></div><div className="metric" aria-label={outputMode === 'gated' ? 'Output blocked responses' : 'Output interruptions'}><span>{''}{outputMode === 'gated' ? 'OUTPUT BLOCKED BEFORE PLAYBACK' : 'OUTPUT INTERRUPTIONS'}</span><strong>{outputMode === 'gated' ? counts.gatedOutputBlocks : counts.outputInterruptions}</strong><p>{counts.outputViolations} violation responses · {outputMode === 'gated' ? 'Rejected held responses; not speech interruptions' : 'Requires browser mute during provider playback; not hardware silence'}</p></div></section>
+          <JudgeCost records={Object.values(usage)} label="Current live session" />
           {outputMode === 'gated' && <p className="muted-note">Whole-response wait: p50 {ms(gateWait.p50)} · p95 {ms(gateWait.p95)} · n={gateWait.count}. Browser response-start receipt to approved output-sink energy; includes collection, relay and gate waiting, separate from judge HTTP time.</p>}
-          <section className="card timeline"><div className="section-header"><h2><Activity size={17} />Event timeline</h2><button className="text-button" disabled={!events.length} onClick={() => download({ source, outputMode, transport: source === 'fixture' ? 'simulated' : transportFor(outputMode), events, incidents: history.incidents, policyVersion: POLICY_VERSION, kbVersion: KB_VERSION }, 'relay-session.json')}><ArrowDownToLine size={14} />Export JSON</button></div><div className="timeline-body">{events.filter(e => e.kind !== 'transcript').length ? events.filter(e => e.kind !== 'transcript').slice(-50).map(event => <div className="timeline-row" key={event.id}><span className={`timeline-dot ${event.kind}`} /><time>{(event.atMs / 1000).toFixed(2)}s</time><span>{timelineLabel(event, history)}</span><small>{event.durationMs !== undefined ? ms(event.durationMs) : event.verdict?.serviceMs != null ? ms(event.verdict.serviceMs) : event.clock}</small></div>) : <div className="empty-timeline">Your session events will appear here. Browser and server clocks are recorded separately.</div>}</div></section>
+          <section className="card timeline"><div className="section-header"><h2><Activity size={17} />Event timeline</h2><button className="text-button" disabled={!events.length} onClick={() =>                     download({ source, outputMode, settings, pricing: sessionPricing, usage: Object.values(usage), transport: transportFor(outputMode), events, incidents: history.incidents, policyVersion: POLICY_VERSION, kbVersion: KB_VERSION }, 'relay-session.json')}><ArrowDownToLine size={14} />Export JSON</button></div><div className="timeline-body">{events.filter(e => e.kind !== 'transcript').length ? events.filter(e => e.kind !== 'transcript').slice(-50).map(event => <div className="timeline-row" key={event.id}><span className={`timeline-dot ${event.kind}`} /><time>{(event.atMs / 1000).toFixed(2)}s</time><span>{timelineLabel(event, history)}</span><small>{event.durationMs !== undefined ? ms(event.durationMs) : event.verdict?.serviceMs != null ? ms(event.verdict.serviceMs) : event.clock}</small></div>) : <div className="empty-timeline">Your session events will appear here. Browser and server clocks are recorded separately.</div>}</div></section>
         </>}
 
         {tab === 'replay' && <>
-          <div className="mode-banner"><Layers3 size={19} /><div><strong>No predetermined winner.</strong> Compare latency alongside accuracy, abstentions and coverage. Authored labels need independent human review. Transcript-only replay does not measure gated audio waiting or either mode’s audio transport.</div></div>
-          <section className="card replay-controls"><div><h2>Run the same evidence</h2><p>One in-flight request and one replaceable pending snapshot per judge. Identical {CHECK_INTERVAL_MS} ms schedule and timeouts. Independent streams continue after a detection.</p></div><div className="replay-actions"><select aria-label="Evaluation split" value={split} disabled={busy} onChange={e => setSplit(e.target.value as typeof split)}><option value="held-out">Held-out · 30 cases</option><option value="tuning">Tuning · 30 cases</option><option value="all">All · 60 cases</option></select><button className="secondary-button" disabled={busy} onClick={() => void runEval('fixture')}><FlaskConical size={16} />Run fixture replay</button><button className="primary-button" disabled={busy || !ready?.jev.configured || !ready.llm.configured} onClick={() => void runEval('provider-replay')}><Play size={14} />Compare providers</button></div>{evaluating && <div className="evaluation-running" role="status"><span className="pulse-dot" />Replaying snapshots…<button className="text-button" onClick={() => evalAbort.current?.abort()}>Cancel</button></div>}</section>
+          <JudgeCost records={result?.usage} label="Selected replay run" />
+          {result?.status && result.status !== 'completed' && <p role="status">Replay {result.status}; cost coverage and checked rows may be partial. {result.error}</p>}
+          <div className="mode-banner"><Layers3 size={19} /><div><strong>No predetermined winner.</strong> Compare latency alongside accuracy, abstentions and coverage. Authored labels need independent human review.           Transcript-only replay always uses its fixed 200 ms schedule, not the live timing controls. It has no acoustic pause evidence and does not measure gated audio waiting or either mode’s audio transport.</div></div>
+          <section className="card replay-controls"><div><h2>Run the same evidence</h2><p>One in-flight request and one replaceable pending snapshot per judge. Identical {CHECK_INTERVAL_MS} ms schedule and timeouts. Independent streams continue after a detection.</p></div><div className="replay-actions"><select aria-label="Evaluation split" value={split} disabled={busy} onChange={e => setSplit(e.target.value as typeof split)}><option value="held-out">Held-out · 30 cases</option><option value="tuning">Tuning · 30 cases</option><option value="all">All · 60 cases</option></select><button className="primary-button" disabled={busy || !ready?.jev.configured || !ready.llm.configured} onClick={() =>           void runEval()}><Play size={14} />Compare providers</button></div>{evaluating && <div className="evaluation-running" role="status"><span className="pulse-dot" />Replaying snapshots…<button className="text-button"           onClick={() => void cancelEval()}>Cancel</button></div>}</section>
           <div className="benchmark-grid">{(['jev', 'llm'] as const).map(p => {
             const summary = result?.source === 'provider-replay' ? result.summaries.find(s => s.provider === p) : undefined;
-            return <section className="card benchmark" key={p}><div className="section-header"><h2><span className={`provider-icon ${p}`}>{p === 'jev' ? 'J' : 'L'}</span>{providerName(p)}</h2><Badge>{summary ? 'Measured service calls' : 'Not measured'}</Badge></div><p>{p === 'jev' ? `${ready?.jev.model ?? 'jev-1.13.0'} · independent typed decisions` : `${ready?.llm.model ?? 'No deployment configured'} · structured output`}</p><div className="benchmark-numbers"><div><span>Input p50 / p95</span><strong>{ms(summary?.input.p50)} / {ms(summary?.input.p95)}</strong></div><div><span>Output p50 / p95</span><strong>{ms(summary?.output.p50)} / {ms(summary?.output.p95)}</strong></div></div><div className="accuracy-row"><span>False positives <b>{summary?.falsePositives ?? '--'}</b></span><span>Misses <b>{summary?.misses ?? '--'}</b></span><span>Abstentions <b>{summary?.abstentions ?? '--'}</b></span></div><p className="muted-note">{summary ? `${summary.correct}/${summary.scoredPolicyDecisions} policy decisions matched authored labels; ${summary.errors} errors. Final-case verdict coverage: ${summary.finalCasesWithVerdict}/${summary.finalCasesChecked}. ${summary.checkedSnapshots} snapshots checked.` : 'No credentials or no measured run yet. Fixture values are never substituted.'}</p></section>;
+            return <section className="card benchmark" key={p}><div className="section-header"><h2><span className={`provider-icon ${p}`}>{p === 'jev' ? 'J' : 'L'}</span>{providerName(p)}</h2><Badge>{summary ? 'Measured service calls' : 'Not measured'}</Badge></div><p>{p === 'jev' ? `${ready?.jev.model ?? 'jev-1.13.0'} · independent typed decisions` : `${ready?.llm.model ?? 'No deployment configured'} · structured output`}</p><div className="benchmark-numbers"><div><span>Input p50 / p95</span><strong>{ms(summary?.input.p50)} / {ms(summary?.input.p95)}</strong></div><div><span>Output p50 / p95</span><strong>{ms(summary?.output.p50)} / {ms(summary?.output.p95)}</strong></div></div><div className="accuracy-row"><span>False positives <b>{summary?.falsePositives ?? '--'}</b></span><span>Misses <b>{summary?.misses ?? '--'}</b></span><span>Abstentions <b>{summary?.abstentions ?? '--'}</b></span></div><p className="muted-note">{summary ? `${summary.correct}/${summary.scoredPolicyDecisions} policy decisions matched authored labels; ${summary.errors} errors. Final-case verdict coverage: ${summary.finalCasesWithVerdict}/${summary.finalCasesChecked}. ${summary.checkedSnapshots} snapshots checked.` : '            No credentials or no measured provider run yet.'}</p></section>;
           })}</div>
-          {result && <section className="card result-panel"><div className="section-header"><h2>{result.source === 'fixture' ? 'Fixture replay complete' : 'Provider replay results'}</h2><button className="text-button" onClick={() => download(result, `relay-eval-${result.id}.json`)}><ArrowDownToLine size={14} />Export results</button></div><p>{result.source === 'fixture' ? `${result.rows.length} authored snapshots exercised the scheduler. Decisions echo authored labels; this is not model accuracy or latency evidence.` : `${result.rows.length} checked snapshots. Errors and uncertainty are reported separately from misses.`}</p><code>{result.file}</code><div className="results-table-wrap"><table><thead><tr><th>Case / snapshot</th><th>Source</th><th>Decision</th><th>Service time</th></tr></thead><tbody>{result.rows.map((r, i) => <tr key={`${r.provider}-${i}`}><td>{r.caseId} <small>+{r.snapshotAtMs} ms</small></td><td>{providerName(r.provider)}</td><td>{r.error ? <span className="error-text">{r.error}</span> : r.verdict?.decision}</td><td>{ms(r.verdict?.serviceMs)}</td></tr>)}</tbody></table></div></section>}
+          {result && <section className="card result-panel"><div className="section-header"><h2>{'Provider replay results'}</h2><button className="text-button" onClick={() => download(result, `relay-eval-${result.id}.json`)}><ArrowDownToLine size={14} />Export results</button></div><p>{`${result.rows.length} checked snapshots. Errors and uncertainty are reported separately from misses.`}</p><code>{result.file}</code><div className="results-table-wrap"><table><thead><tr><th>Case / snapshot</th><th>Source</th><th>Decision</th><th>Service time</th></tr></thead><tbody>{result.rows.map((r, i) => <tr key={`${r.provider}-${i}`}><td>{r.caseId} <small>+{r.snapshotAtMs} ms</small></td><td>{providerName(r.provider)}</td><td>{r.error ? <span className="error-text">{r.error}</span> : r.verdict?.decision}</td><td>{ms(r.verdict?.serviceMs)}</td></tr>)}</tbody></table></div></section>}
           <section className="card corpus"><div className="section-header"><h2>Review the evaluation corpus</h2><div className="segmented">{(['all', 'input', 'output'] as const).map(f => <button className={filter === f ? 'chosen' : ''} key={f} onClick={() => setFilter(f)}>{f}</button>)}</div></div><p>60 concrete cases, balanced across six policies. Odd IDs are tuning; even IDs are held-out. Labels are synthetic, authored for review, not independently validated.</p><div className="case-list">{cases.filter(c => filter === 'all' || c.phase === filter).map(c => <details key={c.id}><summary><code>{c.id}</code><span>{c.snapshots.at(-1)?.text}</span><Badge>{c.split}</Badge></summary><div className="case-detail"><p>{c.rationale}</p>{c.recentContext.length > 0 && <p><b>Recent context:</b> {c.recentContext.map(t => `${t.role}: ${t.text}`).join(' / ')}</p>}{c.snapshots.map(s => <div className="snapshot" key={s.atMs}><code>+{s.atMs} ms</code><p>{s.text}</p><span>{s.expected.map(p => `${p.policy}: ${p.decision}`).join(' · ')}</span></div>)}</div></details>)}</div></section>
           <div className="footnote"><CircleHelp size={16} /><p>Judge latency is server-monotonic HTTP service time, including network and response parsing. Coalescing may change which intermediate snapshots each provider sees; compare final-case coverage and report abstentions. No audio recordings or phrase alignment are supplied. “Miss” means an authored violation explicitly classified allow; uncertainty and errors remain separate.</p></div>
         </>}

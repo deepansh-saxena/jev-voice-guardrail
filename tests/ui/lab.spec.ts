@@ -12,65 +12,16 @@ test.beforeEach(async ({ page }) => {
   await page.routeWebSocket('**/ws', ws => ws.onMessage(() => ws.send(JSON.stringify({ type: 'fatal', message: 'Test control transport unavailable.' }))));
 });
 
-test('fixture mode shows an honest normal flow and never requests a microphone', async ({ page }) => {
-  const errors: string[] = [];
-  page.on('pageerror', error => errors.push(error.message));
-  await page.addInitScript(() => {
-    navigator.mediaDevices.getUserMedia = async () => { throw new Error('Fixture must not request media'); };
-  });
-  await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Voice, with boundaries.' })).toBeVisible();
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await expect(page.getByLabel('ENFORCING JUDGE')).toHaveText('Authored fixture oracle');
-  await page.clock.install();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await expect(page.getByRole('button', { name: 'Stress test', exact: true })).toBeDisabled();
-  await page.clock.runFor(3200);
-  await expect(page.getByText('I can discuss current features, but not unreleased plans.', { exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Play fixture' })).toBeEnabled({ timeout: 8000 });
-  await expect(page.getByText('No measured provider samples')).toBeVisible();
-  await expect(page.getByRole('alert')).toHaveCount(0);
-  expect(errors).toEqual([]);
-});
 
-test('stress fixture exposes synthetic facts and depicts interruption and recovery', async ({ page }) => {
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await page.getByRole('button', { name: 'Stress test', exact: true }).click();
-  await page.clock.install();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await page.clock.runFor(4200);
-  await expect(page.getByText('I can explain Relay features. Project Lantern will bring offline editing on November 15.', { exact: true })).toBeVisible();
-  await expect(page.getByText('Simulated detect and interrupt; no real audio played', { exact: true })).toBeVisible();
-  await expect(page.getByText('Let me keep this to public Relay information. I can help with current features, plans or billing.', { exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Play fixture' })).toBeEnabled();
-});
 
-test('stopping a fixture removes pending events and unlocks configuration', async ({ page }) => {
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await page.clock.install();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await page.getByRole('button', { name: 'Stop session' }).click();
-  const messagesAtStop = await page.locator('.message').allTextContents();
-  await page.clock.runFor(4200);
-  await expect(page.getByRole('button', { name: 'Stress test', exact: true })).toBeEnabled();
-  expect(await page.locator('.message').allTextContents()).toEqual(messagesAtStop);
-});
 
-test('runs replay through the API and keeps fixture results out of provider latency panels', async ({ page }) => {
-  await page.goto('/');
-  await page.getByRole('navigation', { name: 'Main navigation', exact: true }).getByRole('button', { name: /Replay bench/ }).click();
-  await page.getByRole('button', { name: 'Run fixture replay' }).click();
-  await expect(page.getByRole('heading', { name: 'Fixture replay complete' })).toBeVisible({ timeout: 15000 });
-  await expect(page.getByText('Not measured', { exact: true })).toHaveCount(2);
-  await expect(page.locator('.results-table-wrap tbody tr')).toHaveCount(30);
-  await expect(page.getByRole('button', { name: 'Compare providers' })).toBeDisabled();
-});
+
+
+
+
 
 test('live mode correctly surfaces missing credentials without requesting a microphone', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Live', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Start microphone' })).toBeDisabled();
   await expect(page.getByText('Use an existing transcription deployment name on the same Azure resource as Realtime.', { exact: false })).toBeVisible();
   await page.getByText('Required local configuration').click();
@@ -84,8 +35,7 @@ test('all sections remain navigable on mobile without horizontal overflow', asyn
   const nav = page.getByRole('navigation', { name: 'Mobile navigation' });
   await expect(nav).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Live voice is not ready yet' })).toBeVisible();
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Play fixture' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Start microphone' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await nav.getByRole('button', { name: 'Knowledge', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Trusted product facts' })).toBeVisible();
@@ -116,7 +66,6 @@ test(`${outputMode}: synthetic microphone tracks stop after a control transport 
     } });
   });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Live', exact: true }).click();
   await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption(outputMode);
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect(page.getByRole('alert')).toContainText('Test control transport unavailable.');
@@ -146,7 +95,6 @@ test(`${outputMode}: late microphone permission resolution cannot leak a track a
     } });
   });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Live', exact: true }).click();
   await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption(outputMode);
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect.poll(() => page.evaluate(() => typeof Reflect.get(window, 'relayGrantMedia'))).toBe('function');
@@ -157,20 +105,3 @@ test(`${outputMode}: late microphone permission resolution cannot leak a track a
   await expect(page.getByRole('alert')).toHaveCount(0);
 });
 }
-
-test('gated stress fixture clearly labels simulated pre-playback blocks through recovery', async ({ page }) => {
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await page.getByLabel('OUTPUT DELIVERY', { exact: true }).selectOption('gated');
-  await page.getByRole('button', { name: 'Stress test', exact: true }).click();
-  await page.clock.install();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await expect(page.getByLabel('OUTPUT DELIVERY', { exact: true })).toBeDisabled();
-  await page.clock.runFor(4300);
-  const history = page.getByRole('region', { name: 'Guardrail incident history' });
-  await expect(history.getByText('SIMULATED OUTPUT BLOCKED BEFORE PLAYBACK', { exact: true })).toBeVisible();
-  await expect(history).toContainText('1 output blocked before playback');
-  await expect(history).toContainText('0 simulated streaming interruptions');
-  await expect(history).toContainText('Simulated approved recovery playback; no real audio');
-  await expect(page.getByLabel('OUTPUT DELIVERY', { exact: true })).toBeEnabled();
-});

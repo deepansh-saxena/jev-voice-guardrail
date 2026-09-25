@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { MAX_TEXT, policyIds, type Phase, type PolicyId } from './policies';
 import type { AudioPartId, AudioPartSummary } from './audio';
+import { defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from './session-settings';
+import { pricingSchema, type Pricing, type JudgeUsage } from './judge-cost';
 
 export const outputModeSchema = z.enum(['monitor', 'gated']);
 export type OutputMode = z.infer<typeof outputModeSchema>;
@@ -9,7 +11,7 @@ export const providerSchema = z.enum(['jev', 'llm']);
 export type Provider = z.infer<typeof providerSchema>;
 export const decisionSchema = z.enum(['allow', 'violate', 'uncertain']);
 export type Decision = z.infer<typeof decisionSchema>;
-export type Source = 'live' | 'provider-replay' | 'fixture';
+export type Source = 'live' | 'provider-replay';
 export const contextSchema = z.array(z.object({
   role: z.enum(['user', 'assistant']), text: z.string().max(MAX_TEXT),
 })).max(8);
@@ -28,7 +30,7 @@ export interface PolicyDecision {
 export interface Verdict {
   decision: Decision;
   policies: PolicyDecision[];
-  provider: Provider | 'fixture';
+  provider: Provider;
   model: string;
   serviceMs: number | null;
   source: Source;
@@ -39,9 +41,9 @@ export function aggregate(decisions: PolicyDecision[]): Decision {
 }
 export interface LabEvent {
   id: string;
-  kind: 'status' | 'transcript' | 'check-start' | 'check-end' | 'error' | 'interrupt' | 'lifecycle' | 'metric';
+  kind: 'status' | 'transcript' | 'check-start' | 'check-end' | 'error' | 'interrupt' | 'lifecycle' | 'metric' | 'usage';
   atMs: number;
-  clock: 'server' | 'browser' | 'fixture';
+  clock: 'server' | 'browser';
   source: Source;
   name: string;
   phase?: Phase;
@@ -55,8 +57,11 @@ export interface LabEvent {
   outputMode?: OutputMode;
   transport?: ReturnType<typeof transportFor>;
   delivery?: 'held' | 'approved' | 'playing' | 'ended' | 'blocked';
+  settings?: SessionSettings;
+  usage?: JudgeUsage;
 }
 export interface Readiness {
+  pricing?: Pricing;
   azure: { configured: boolean; missing: string[]; transport: string; deployment: string };
   jev: { configured: boolean; missing: string[]; model: string };
   llm: { configured: boolean; missing: string[]; model: string; reasoning: string };
@@ -82,8 +87,10 @@ export type GatedServerMessage =
   | ({ type: 'audio-release'; revision: number } & AudioIdentity);
 
 export const clientMessageSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('connect'), outputMode: z.literal('monitor').default('monitor'), sdp: z.string().min(10).max(100000), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
-  z.object({ type: z.literal('connect-gated'), outputMode: z.literal('gated'), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('connect'), pricing: pricingSchema.optional(), settings: sessionSettingsSchema.default(defaultSessionSettings), outputMode: z.literal('monitor').default('monitor'), sdp: z.string().min(10).max(100000), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('connect-gated'), pricing: pricingSchema.optional(), settings: sessionSettingsSchema.default(defaultSessionSettings), outputMode: z.literal('gated'), provider: providerSchema, mode: z.enum(['normal', 'stress']) }).strict(),
+  z.object({ type: z.literal('assistant-pause'), responseId: z.string().min(1).max(200), requestId: z.string().min(1).max(100),
+    turn: z.number().int().positive(), sequence: z.number().int().positive().max(10000), sampleOffsetMs: z.number().finite().min(0).max(600000) }).strict(),
   z.object({ type: z.literal('audio-input'), data: z.string().min(4).max(6400) }).strict(),
   z.object({ type: z.literal('local-playback'), state: z.enum(['started', 'ended']), responseId: z.string().min(1).max(200), requestId: z.string().min(1).max(100) }).strict(),
   z.object({ type: z.literal('armed'), requestId: z.string().max(100) }).strict(),
@@ -94,7 +101,8 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
 ]);
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export const evalRequestSchema = z.object({
-  source: z.enum(['fixture', 'provider-replay']),
+  source: z.literal('provider-replay'),
+  pricing: pricingSchema.optional(),
   split: z.enum(['tuning', 'held-out', 'all']),
   caseIds: z.array(z.string().max(80)).min(1).max(60).optional(),
 }).strict();

@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { CHECK_INTERVAL_MS, MAX_TEXT, recovery, type PolicyId } from '../shared/policies';
+import { MAX_TEXT, recovery, type PolicyId } from '../shared/policies';
 import { transportFor, type Context, type JudgeInput, type LabEvent, type OutputMode, type ServerMessage, type Verdict } from '../shared/protocol';
 import { audioPartKey, decodePcm, MAX_OUTPUT_SECONDS, PcmResponseBuffer, type AudioPartId } from '../shared/audio';
 import type { RealtimeEvent } from '../shared/realtime';
 import { bounded, CoalescingScheduler, errorMessage } from './async';
 import type { Judge } from './judges';
+import { cadenceDescription, defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
+import { AudioPauseDetector } from '../shared/audio-pause';
+import { PCM_SAMPLE_RATE } from '../shared/audio';
 
 interface Turn { id: string; number: number; transcript?: string; stoppedAt?: number }
 interface Request {
@@ -18,6 +21,7 @@ interface Active {
   done: boolean; playbackStopped: boolean; interrupted: boolean; cleared: boolean;
   muted: boolean; playbackStarted: boolean; clearRequested: boolean; actionId?: string; cancelId?: string; recoveryText?: string;
   requestId: string; audio: PcmResponseBuffer; audioSealed: boolean; finalChecked: boolean; releaseSent: boolean; localStarted: boolean;
+  pausePending: boolean; pauseSequence: number; detectors: Map<string, AudioPauseDetector>;
 }
 interface Snapshot extends JudgeInput { responseId: string; revision: number; turn: number }
 interface EngineHooks {
@@ -39,13 +43,15 @@ export class GuardrailEngine {
   private approvedRefs: string[] = [];
   private disposed = false;
   private epoch = 0;
-  private tick: ReturnType<typeof setInterval>;
+  private tick?: ReturnType<typeof setInterval>;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private now: () => number;
   private startedAt: number;
   private scheduler: CoalescingScheduler<Snapshot, Verdict>;
 
-  constructor(private judge: Judge, private hooks: EngineHooks, private timeoutMs: number, private outputMode: OutputMode = 'monitor') {
+  constructor(private judge: Judge, private hooks: EngineHooks, private timeoutMs: number, private outputMode: OutputMode = 'monitor',
+    private settings: SessionSettings = defaultSessionSettings) {
+    this.settings = sessionSettingsSchema.parse(settings);
     this.now = hooks.now ?? (() => performance.now());
     this.startedAt = this.now();
     this.scheduler = new CoalescingScheduler(
@@ -55,14 +61,14 @@ export class GuardrailEngine {
       },
       (snapshot, verdict) => this.outputVerdict(snapshot, verdict),
       (_snapshot, error) => this.fault(errorMessage(error)),
-      CHECK_INTERVAL_MS, timeoutMs, this.now,
+      settings.outputCadence === 'periodic' ? settings.outputIntervalMs : 0, timeoutMs, this.now,
     );
-    this.tick = setInterval(() => this.snapshot(false), CHECK_INTERVAL_MS);
+    if (settings.outputCadence === 'periodic') this.tick = setInterval(() => this.snapshot(false), settings.outputIntervalMs);
   }
 
   private emit(event: Omit<LabEvent, 'id' | 'atMs' | 'clock' | 'source'>) {
     const full: LabEvent = { id: randomUUID(), atMs: this.now() - this.startedAt, clock: 'server', source: 'live', turn: this.turn?.number,
-      outputMode: this.outputMode, transport: transportFor(this.outputMode), ...event };
+      outputMode: this.outputMode, transport: transportFor(this.outputMode), settings: this.settings, ...event };
     this.hooks.browser({ type: 'event', event: full });
     this.hooks.event?.(full);
   }
@@ -244,9 +250,11 @@ export class GuardrailEngine {
       id, turn: pending.turn, recovery: !!pending.recoveryText, parts: new Map(), items: new Set(), deleted: new Set(),
       revision: 0, checked: -1, offered: '', done: false, playbackStopped: false, playbackStarted: false, interrupted: false, cleared: false, muted: false, clearRequested: false,
       requestId: pending.id, audio: new PcmResponseBuffer(), audioSealed: false, finalChecked: false, releaseSent: false, localStarted: false,
+      pausePending: false, pauseSequence: 0, detectors: new Map(),
     };
     this.deadline('generation', 45000, 'Response generation/playback lifecycle exceeded 45 seconds.');
     this.emit({ kind: 'lifecycle', name: 'Response started', responseId: id });
+    this.emit({ kind: 'lifecycle', name: cadenceDescription(this.settings), responseId: id });
     if (this.outputMode === 'gated') {
       this.hooks.browser({ type: 'audio-start', responseId: id, requestId: pending.id, turn: pending.turn });
       this.emit({ kind: 'lifecycle', name: 'Output held; collecting native audio and checking text', delivery: 'held', responseId: id });
@@ -262,8 +270,15 @@ export class GuardrailEngine {
       if (active.done) throw new Error('Audio arrived after generation completion.');
       active.items.add(part.itemId);
       if (event.type === 'response.output_audio.delta') {
-        active.audio.append(part, decodePcm(event.delta));
+        const bytes = decodePcm(event.delta);
+        active.audio.append(part, bytes);
         this.hooks.browser({ type: 'audio-chunk', responseId: active.id, part, data: event.delta });
+        if (this.settings.outputCadence === 'pauses') {
+          const key = audioPartKey(part);
+          let detector = active.detectors.get(key);
+          if (!detector) { detector = new AudioPauseDetector(PCM_SAMPLE_RATE, this.settings.assistantPauseMs); active.detectors.set(key, detector); }
+          for (const offset of detector.pushPcm16(bytes)) this.acousticPause(offset);
+        }
       } else {
         active.audio.finishPart(part);
         this.hooks.browser({ type: 'audio-part-done', responseId: active.id, part });
@@ -271,7 +286,24 @@ export class GuardrailEngine {
     } catch { this.fault('Native output audio was malformed, incomplete or exceeded the 30-second buffer. Nothing was released.'); }
   }
 
-  private updatePart(itemId: string, output: number, content: number, text: string, final: boolean) {
+  assistantPause(responseId: string, requestId: string, turn: number, sequence: number, sampleOffsetMs: number) {
+    const active = this.active;
+    if (this.disposed || this.outputMode !== 'monitor' || this.settings.outputCadence !== 'pauses' || !active
+      || active.interrupted || active.done || active.id !== responseId || active.requestId !== requestId
+      || active.turn !== turn || turn !== this.turn?.number || sequence <= active.pauseSequence) return;
+    active.pauseSequence = sequence;
+    this.acousticPause(sampleOffsetMs);
+  }
+  private acousticPause(sampleOffsetMs: number) {
+    const active = this.active;
+    if (!active || active.done || active.interrupted) return;
+    active.pausePending = true;
+    this.emit({ kind: 'lifecycle', name: `Assistant acoustic pause (${this.settings.assistantPauseMs} ms; not sentence alignment)`,
+      responseId: active.id, durationMs: sampleOffsetMs });
+    this.snapshot(false);
+  }
+
+  private updatePart(itemId: string, output: number, content: number, text: string, final: boolean, deferCheck = false) {
     const active = this.active;
     if (!active) return;
     const key = `${itemId}:${content}`;
@@ -288,7 +320,7 @@ export class GuardrailEngine {
         this.deadline('output-transcript', 2500, 'Output transcription stalled while audio was playing.');
     }
     this.emit({ kind: 'transcript', name: 'Assistant generated transcript (not aligned to heard audio)', role: 'assistant', phase: 'output', responseId: active.id, revision: active.revision, text: full });
-    if (final) this.snapshot(true);
+    if (!deferCheck && ((final && this.settings.outputCadence === 'periodic') || active.pausePending)) this.snapshot(false);
   }
 
   private text() {
@@ -297,10 +329,12 @@ export class GuardrailEngine {
   private snapshot(final: boolean) {
     const active = this.active;
     if (!active || active.interrupted || this.disposed || !this.text().trim()) return;
-    const isFinal = this.outputMode === 'gated' ? active.done : final || active.done;
+    const isFinal = active.done;
+    if (!isFinal && (this.settings.outputCadence === 'complete' || (this.settings.outputCadence === 'pauses' && !active.pausePending))) return;
     const key = `${active.revision}:${isFinal}`;
     if (active.offered === key || (!final && active.offered.startsWith(`${active.revision}:`))) return;
     active.offered = key;
+    active.pausePending = false;
     this.scheduler.offer({
       phase: 'output', text: this.text(), final: isFinal, recentContext: [...this.context],
       responseId: active.id, revision: active.revision, turn: active.turn,
@@ -329,7 +363,7 @@ export class GuardrailEngine {
     for (const [index, item] of (event.response.output ?? []).entries()) {
       active.items.add(item.id);
       if (!active.interrupted) for (const [contentIndex, part] of (item.content ?? []).entries()) {
-        if (part.transcript !== undefined) this.updatePart(item.id, index, contentIndex, part.transcript, true);
+        if (part.transcript !== undefined) this.updatePart(item.id, index, contentIndex, part.transcript, true, true);
       }
     }
     active.done = true;

@@ -1,6 +1,9 @@
 import type { AgentMode } from '../shared/policies';
 import type { ClientMessage, LabEvent, Provider, ServerMessage } from '../shared/protocol';
 import { parseRealtime } from '../shared/realtime';
+import { defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
+import pauseWorkletUrl from './pause-worklet.ts?worker&url';
+import type { Pricing } from '../shared/judge-cost';
 
 export interface LiveCallbacks {
   event: (event: LabEvent) => void;
@@ -16,6 +19,9 @@ export class LiveCall {
   private muted = true;
   private outputGain?: GainNode;
   private outputSource?: MediaStreamAudioSourceNode;
+  private pauseNode?: AudioWorkletNode;
+  private settings = defaultSessionSettings;
+  private armedTurn?: number;
   private audioContext?: AudioContext;
   private analyser?: AnalyserNode;
   private frame?: number;
@@ -37,8 +43,9 @@ export class LiveCall {
   private startAt = performance.now();
   constructor(private callbacks: LiveCallbacks) {}
 
-  async start(provider: Provider, mode: AgentMode) {
+  async start(provider: Provider, mode: AgentMode, settings: SessionSettings = defaultSessionSettings, pricing?: Pricing) {
     try {
+      this.settings = sessionSettingsSchema.parse(settings);
       if (!navigator.mediaDevices?.getUserMedia) {
         this.fail('Microphone API unavailable. Use a supported browser on localhost or HTTPS.');
         return;
@@ -47,6 +54,20 @@ export class LiveCall {
       this.remoteRenderer.muted = true;
       this.audioContext = new AudioContext();
       await this.audioContext.resume();
+      if (this.stopped) return;
+      if (settings.outputCadence === 'pauses') {
+        await this.audioContext.audioWorklet.addModule(pauseWorkletUrl);
+        if (this.stopped) return;
+        this.pauseNode = new AudioWorkletNode(this.audioContext, 'relay-assistant-pauses', {
+          channelCount: 1, channelCountMode: 'explicit', outputChannelCount: [1],
+        });
+        this.pauseNode.connect(this.audioContext.destination); // Detector output is always zero.
+        this.pauseNode.onprocessorerror = () => this.fail('Assistant acoustic pause detection failed. Start a new call.');
+        this.pauseNode.port.onmessage = ({ data }: MessageEvent<Omit<Extract<ClientMessage, { type: 'assistant-pause' }>, 'type'>>) => {
+          if (!this.stopped && !this.muted && !this.speaking && data.responseId === this.responseId && data.requestId === this.armedId)
+            this.send({ type: 'assistant-pause', ...data });
+        };
+      }
       this.outputGain = this.audioContext.createGain();
       this.outputGain.gain.value = 0;
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
@@ -68,6 +89,7 @@ export class LiveCall {
           this.analyser.fftSize = 512;
           this.outputSource = this.audioContext.createMediaStreamSource(remote);
           this.outputSource.connect(this.outputGain);
+          if (this.pauseNode) this.outputSource.connect(this.pauseNode);
           this.outputGain.connect(this.analyser);
           this.analyser.connect(this.audioContext.destination);
           this.measureEnergy();
@@ -121,13 +143,19 @@ export class LiveCall {
             case 'output_audio_buffer.started':
               if (realtime.response_id === this.responseId) {
                 this.playbackAt = performance.now();
+                if (!this.muted && this.armedId && this.armedTurn !== undefined) this.pauseNode?.port.postMessage({
+                  identity: { responseId: this.responseId, requestId: this.armedId, turn: this.armedTurn }, pauseMs: this.settings.assistantPauseMs,
+                });
                 this.metric('playback-start-event', this.playbackAt - this.startAt);
                 this.measureOffset();
               }
               break;
             case 'output_audio_buffer.stopped':
             case 'output_audio_buffer.cleared':
-              if (realtime.response_id === this.responseId) this.metric('playback-stop-event', performance.now() - this.startAt);
+              if (realtime.response_id === this.responseId) {
+                this.pauseNode?.port.postMessage({ pauseMs: this.settings.assistantPauseMs });
+                this.metric('playback-stop-event', performance.now() - this.startAt);
+              }
               break;
             case 'response.output_audio_transcript.delta':
               if (this.responseId === realtime.response_id && this.transcriptAt === undefined) {
@@ -142,11 +170,12 @@ export class LiveCall {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       if (this.stopped) return;
+      this.lastHeartbeat = performance.now();
       const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
       this.ws = ws;
       ws.onopen = () => {
         if (this.stopped) { ws.close(); return; }
-        this.send({ type: 'connect', outputMode: 'monitor', sdp: offer.sdp!, provider, mode });
+        this.send({ type: 'connect', outputMode: 'monitor', sdp: offer.sdp!,         provider, mode, settings: this.settings, pricing });
       };
       ws.onmessage = async event => {
         if (this.stopped) return;
@@ -165,6 +194,7 @@ export class LiveCall {
           else if (message.type === 'arm') {
             if (this.currentInput !== message.inputItemId || this.speaking) return;
             this.armedId = message.requestId;
+            this.armedTurn = message.turn;
             this.authorizedRequests.add(message.requestId);
             this.setMuted(false);
             this.send({ type: 'armed', requestId: message.requestId });
@@ -198,12 +228,13 @@ export class LiveCall {
   private setMuted(value: boolean) {
     this.muted = value;
     if (this.outputGain) this.outputGain.gain.value = value ? 0 : 1;
+    if (value) this.pauseNode?.port.postMessage({ pauseMs: this.settings.assistantPauseMs });
   }
   private metric(name: Extract<ClientMessage, { type: 'metric' }>['name'], durationMs: number) {
     const atMs = performance.now() - this.startAt;
     this.send({ type: 'metric', name, durationMs, atMs, responseId: this.responseId });
     this.callbacks.event({ id: crypto.randomUUID(), source: 'live', clock: 'browser', kind: 'metric',
-      name, durationMs, atMs, responseId: this.responseId });
+      name, durationMs, atMs, responseId: this.responseId, settings: this.settings, outputMode: 'monitor', transport: 'azure-webrtc-sideband' });
   }
   private measureOffset() {
     if (!this.offsetMeasured && this.transcriptAt !== undefined && this.playbackAt !== undefined) {
@@ -237,6 +268,8 @@ export class LiveCall {
     this.stream?.getTracks().forEach(track => { track.enabled = false; track.stop(); });
     this.pc?.getReceivers().forEach(receiver => receiver.track?.stop());
     this.outputSource?.disconnect();
+    this.pauseNode?.port.close();
+    this.pauseNode?.disconnect();
     this.outputGain?.disconnect();
     this.analyser?.disconnect();
     this.dc?.close();

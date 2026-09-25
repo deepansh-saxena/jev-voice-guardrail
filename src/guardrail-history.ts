@@ -31,7 +31,7 @@ export const policyNames = (ids: PolicyId[]) => ids.map(id => policies.find(p =>
 function policyInterruption(event: LabEvent, incident: GuardrailIncident) {
   return event.kind === 'interrupt' && event.source === incident.first.source
     && event.responseId !== undefined && event.responseId === incident.first.responseId
-    && (event.source === 'fixture' || incident.policies.some(id => event.name === `Output violation: ${id}`));
+    && (incident.policies.some(id => event.name === `Output violation: ${id}`));
 }
 
 export function appendHistory(history: GuardrailHistory, event: LabEvent): GuardrailHistory {
@@ -92,9 +92,7 @@ export function outputPauseLabel(event: LabEvent) {
 }
 
 export function confirmedInterruption(incident: GuardrailIncident) {
-  return incident.first.phase === 'output' && incident.first.outputMode !== 'gated' && (incident.first.source === 'fixture'
-    ? incident.action === 'requested'
-    : incident.action === 'muted' && incident.playbackAtVerdict === 'playing' && incident.playbackAtMute === 'playing');
+  return incident.first.phase === 'output' && incident.first.outputMode !== 'gated' && (incident.action === 'muted' && incident.playbackAtVerdict === 'playing' && incident.playbackAtMute === 'playing');
 }
 export function incidentCounts(history: GuardrailHistory) {
   return {
@@ -108,18 +106,12 @@ export function incidentLabel(incident: GuardrailIncident) {
   const label = incident.first.phase === 'input' ? 'INPUT BLOCKED'
     : incident.first.outputMode === 'gated' ? 'OUTPUT BLOCKED BEFORE PLAYBACK'
     : confirmedInterruption(incident) ? 'OUTPUT INTERRUPTED' : 'OUTPUT VIOLATION';
-  return `${incident.first.source === 'fixture' ? 'SIMULATED ' : ''}${label}`;
+  return label;
 }
 export function incidentDetail(incident: GuardrailIncident) {
-  if (incident.first.phase === 'input') return incident.first.source === 'fixture'
-    ? 'Authored input block; no real answer or audio was generated.'
-    : 'Original answer blocked before generation. Only a monitored redirect may follow.';
-  if (incident.first.outputMode === 'gated') return incident.first.source === 'fixture'
-    ? 'Simulated held output rejected; no real audio played.'
-    : 'Held native audio rejected before playback. A separate recovery must pass its own final output gate.';
-  if (incident.first.source === 'fixture') return incident.action === 'detected'
-    ? 'Authored violation; simulated interruption not yet shown.'
-    : 'Scripted interruption only; no real audio played.';
+  if (incident.first.phase === 'input') return 'Original answer blocked before generation. Only a monitored redirect may follow.';
+  if (incident.first.outputMode === 'gated') return 'Held native audio rejected before playback. A separate recovery must pass its own final output gate.';
+
   if (incident.playbackAtVerdict === 'stopped')
     return 'Violation detected after provider playback ended; not counted as stopped speech.';
   if (incident.action === 'detected') return 'Violation detected; no interruption request observed yet.';
@@ -132,28 +124,27 @@ export function incidentDetail(incident: GuardrailIncident) {
 }
 
 export function timelineLabel(event: LabEvent, history: GuardrailHistory) {
-  const simulated = event.source === 'fixture' ? ' (simulated)' : '';
   if (event.kind === 'check-end' && event.phase && event.verdict) {
     if (event.verdict.decision === 'violate') return `${event.phase === 'input'
-      ? 'Input blocked before answer' : event.outputMode === 'gated' ? 'Output blocked before playback' : 'Output violation detected'}: ${policyNames(violatedPolicies(event))}${simulated}`;
+      ? 'Input blocked before answer' : event.outputMode === 'gated' ? 'Output blocked before playback' : 'Output violation detected'}: ${policyNames(violatedPolicies(event))      }`;
     if (event.verdict.decision === 'uncertain') {
       const ids = event.verdict.policies.filter(p => p.decision === 'uncertain').map(p => p.policy);
-      return `${event.phase === 'input' ? 'Input needs clarification' : 'Output uncertain'}: ${policyNames(ids)} (not a confirmed violation)${simulated}`;
+      return `${event.phase === 'input' ? 'Input needs clarification' : 'Output uncertain'}: ${policyNames(ids)      } (not a confirmed violation)`;
     }
-    return `${event.phase === 'input' ? 'Input allowed' : 'Output clear so far'}${simulated}`;
+    return event.phase === 'input' ? 'Input allowed' : 'Output clear so far';
   }
-  if (event.kind === 'lifecycle' && ['Constrained recovery authorized', 'Constrained redirect (fixture)'].includes(event.name)) {
+  if (event.kind === 'lifecycle' && event.name === 'Constrained recovery authorized') {
     const input = history.inputChecks[turnKey(event)];
     const output = history.incidents.find(i => i.first.phase === 'output' && i.first.source === event.source
       && i.first.turn === event.turn && i.first.clock === event.clock && i.first.atMs < event.atMs);
     const reason = input?.verdict?.decision === 'violate' ? 'after input block'
       : input?.verdict?.decision === 'uncertain' ? 'for uncertain input'
         : output ? 'after output violation' : undefined;
-    return `${reason === 'for uncertain input' ? 'Clarification' : reason ? 'Safe redirect' : 'Safe redirect or clarification'} authorized${reason ? ` ${reason}` : ''} (output-monitored)${simulated}`;
+    return `${reason === 'for uncertain input' ? 'Clarification' : reason ? 'Safe redirect' : 'Safe redirect or clarification'} authorized${reason ? ` ${reason}` : ''} (output-monitored)`;
   }
   if (event.kind === 'interrupt' && event.name === 'User interruption') return 'User barge-in (not a policy violation)';
   const incident = history.incidents.find(i => policyInterruption(event, i));
-  if (incident && event.source !== 'fixture')
+  if (incident)
     return `Output interruption requested: ${policyNames(incident.policies)} (not yet a mute confirmation)`;
   return event.name;
 }

@@ -4,6 +4,8 @@ import { PCM_SAMPLE_RATE } from '../shared/audio';
 import { GatedPlayer } from './gated-player';
 import type { LiveCallbacks } from './live';
 import workletUrl from './pcm-worklet.ts?worker&url';
+import { defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
+import type { Pricing } from '../shared/judge-cost';
 
 export class GatedLiveCall {
   private ws?: WebSocket;
@@ -21,10 +23,12 @@ export class GatedLiveCall {
   private heartbeat?: ReturnType<typeof setInterval>;
   private lastHeartbeat = performance.now();
   private began = performance.now();
+  private settings = defaultSessionSettings;
   constructor(private callbacks: LiveCallbacks) {}
 
-  async start(provider: Provider, mode: AgentMode) {
+  async start(provider: Provider, mode: AgentMode, settings: SessionSettings = defaultSessionSettings, pricing?: Pricing) {
     try {
+      this.settings = sessionSettingsSchema.parse(settings);
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone API unavailable on this browser.');
       this.callbacks.status('Requesting microphone');
       const context = new AudioContext({ sampleRate: PCM_SAMPLE_RATE });
@@ -69,7 +73,7 @@ export class GatedLiveCall {
       const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
       this.ws = ws;
       this.callbacks.status('Connecting native PCM relay');
-      ws.onopen = () => this.send({ type: 'connect-gated', outputMode: 'gated', provider, mode });
+      ws.onopen = () => this.send({ type: 'connect-gated', outputMode: 'gated',       provider, mode, settings: this.settings, pricing });
       ws.onmessage = event => {
         if (this.stopped) return;
         try { this.receive(JSON.parse(event.data) as ServerMessage); }
@@ -142,7 +146,7 @@ export class GatedLiveCall {
     const atMs = performance.now() - this.began;
     this.send({ type: 'metric', name, durationMs, atMs, responseId });
     this.callbacks.event({ id: crypto.randomUUID(), source: 'live', clock: 'browser', kind: 'metric', name,
-      durationMs, atMs, responseId, outputMode: 'gated', transport: 'azure-websocket-pcm-relay' });
+      durationMs, atMs, responseId, settings: this.settings, outputMode: 'gated', transport: 'azure-websocket-pcm-relay' });
   }
   private send(message: ClientMessage) { if (!this.stopped && this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message)); }
   private fail(message: string) {

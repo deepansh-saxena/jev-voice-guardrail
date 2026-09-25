@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { phasePolicies, type Phase, type PolicyId } from '../../shared/policies';
 import type { LabEvent } from '../../shared/protocol';
+import { referencePricing, type JudgeUsage } from '../../shared/judge-cost';
 
 let serial = 0;
 function event(fields: Partial<LabEvent>): LabEvent {
@@ -32,7 +33,7 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/javascript',
     body: `export class LiveCall {
       constructor(callbacks) { this.callbacks = callbacks; }
-      start() { window.relayUiEvents = events => events.forEach(this.callbacks.event); this.callbacks.status('Listening'); }
+      start(provider, mode, settings, pricing) { window.relayUiStart = { provider, mode, settings, pricing }; window.relayUiEvents = events => events.forEach(this.callbacks.event); this.callbacks.status('Listening'); }
       stop() { this.callbacks.status('Stopped'); }
     }`,
   }));
@@ -41,6 +42,49 @@ test.beforeEach(async ({ page }) => {
   });
   await page.goto('/');
 });
+
+  test('real-only UI records settings and retains deduplicated money totals across timeline rollover', async ({ page }) => {
+    await expect(page.getByRole('button', { name: 'Fixture', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Play fixture', exact: true })).toHaveCount(0);
+    await page.getByLabel('USER INPUT SILENCE (MS)').fill('99');
+    await expect(page.getByRole('button', { name: 'Start microphone' })).toBeDisabled();
+    await page.getByLabel('USER INPUT SILENCE (MS)').fill('750');
+    await page.getByLabel('OUTPUT CHECK TIMING').selectOption('complete');
+    await expect(page.getByText('Checks wait for generation to finish. You may hear the entire answer before a verdict.')).toBeVisible();
+    await page.getByRole('button', { name: 'Start microphone' }).click();
+    expect(await page.evaluate(() => Reflect.get(window, 'relayUiStart'))).toMatchObject({ settings: { inputSilenceMs: 750, outputCadence: 'complete' } });
+    await expect(page.getByLabel('OUTPUT CHECK TIMING')).toBeDisabled();
+    await page.getByText('Judge token prices · USD per 1 million tokens', { exact: true }).click();
+    await expect(page.getByLabel('jev input USD/M')).toBeDisabled();
+    const rates = referencePricing('jev-1.13.0', 'gpt-5.4-mini');
+    const usage: JudgeUsage = { callId: 'cost-one', phase: 'input', provider: 'jev', model: 'jev-1.13.0',
+      status: 'reported', usage: { input: 1000, cachedInput: 0, output: 5 }, rates: rates.jev, estimatedUsd: 0.000042 };
+    await deliver(page, [event({ kind: 'usage', usage }), event({ kind: 'usage', usage }),
+      ...Array.from({ length: 610 }, () => verdict('output', [], { responseId: 'safe' }))]);
+    const cost = page.getByRole('region', { name: 'Current live session judge cost' });
+    await expect(cost).toContainText('$0.000042');
+    await expect(cost).toContainText('1/1 calls with reported usage');
+    await deliver(page, [event({ kind: 'usage', usage: { ...usage, callId: 'recovery', phase: 'output' } }),
+      event({ kind: 'usage', usage: { ...usage, callId: 'unknown', status: 'unavailable', usage: null, estimatedUsd: null } })]);
+    await expect(cost).toContainText('$0.000084');
+    await expect(cost).toContainText('partial estimate');
+    await page.getByRole('button', { name: 'Stop session' }).click();
+    await page.getByLabel('jev input USD/M').fill('2');
+    await expect(cost).toContainText('$0.000084');
+  });
+
+  test('real replay uses only configured providers; legacy simulation requests are rejected', async ({ page }) => {
+    await page.route('**/api/evaluate', async route => {
+      expect(route.request().postDataJSON()).toMatchObject({ source: 'provider-replay' });
+      await route.fulfill({ json: { id: 'test-replay', createdAt: '', source: 'provider-replay', rows: [], summaries: [], usage: [], status: 'completed', file: 'test-only' } });
+    });
+    await page.getByRole('navigation', { name: 'Main navigation', exact: true }).getByRole('button', { name: /Replay bench/ }).click();
+    await expect(page.getByRole('button', { name: 'Run fixture replay' })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Compare providers' }).click();
+    await expect(page.getByRole('heading', { name: 'Provider replay results' })).toBeVisible();
+    const rejected = await page.request.post('/api/evaluate', { data: { source: 'fixture', split: 'all' } });
+    expect(rejected.status()).toBe(400);
+  });
 
 test('two input blocks stay prominent with actual message associations and counts after safe redirects', async ({ page }) => {
   await page.getByRole('button', { name: 'Start microphone' }).click();
@@ -134,31 +178,8 @@ test('uncertain input and technical errors are separate, with late output detect
   await expect(history).toContainText('after provider playback ended');
   await expect(page.locator('[aria-label="Output interruptions"] strong')).toHaveText('0');
   await page.getByRole('button', { name: 'Stop session' }).click();
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
+  await page.getByRole('button', { name: 'Start microphone', exact: true }).click();
   await expect(history.locator('.guardrail-incident')).toHaveCount(0);
   await expect(history.locator('.clarification-notice')).toHaveCount(0);
   await expect(history.locator('.unavailable-notice')).toHaveCount(0);
-});
-
-test('fixture input blocks and output interruptions are explicitly simulated and remain readable on mobile', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('button', { name: 'Fixture', exact: true }).click();
-  await page.getByRole('button', { name: /Outside the product/ }).click();
-  await page.clock.install();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await page.clock.runFor(3200);
-  const history = page.getByRole('region', { name: 'Guardrail incident history' });
-  await expect(history.getByText('SIMULATED INPUT BLOCKED', { exact: true })).toBeVisible();
-  await expect(page.locator('.message.user')).toContainText('SIMULATED INPUT BLOCKED: Product scope');
-  await expect(page.locator('[aria-label="Input blocked turns"] strong')).toHaveText('1');
-  await expect(history).toContainText('Authored timing, not measured');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  await page.getByRole('button', { name: /The unreleased feature/ }).click();
-  await page.getByRole('button', { name: 'Stress test', exact: true }).click();
-  await page.getByRole('button', { name: 'Play fixture' }).click();
-  await page.clock.runFor(4200);
-  await expect(history.getByText('SIMULATED OUTPUT INTERRUPTED', { exact: true })).toBeVisible();
-  await expect(history).toContainText('Scripted interruption only; no real audio played.');
-  await expect(page.locator('[aria-label="Input blocked turns"] strong')).toHaveText('0');
-  await expect(page.locator('[aria-label="Output interruptions"] strong')).toHaveText('1');
 });

@@ -1,5 +1,5 @@
 import { phasePolicies, type Phase, type PolicyId } from './policies';
-import { aggregate, type Context, type Decision, type PolicyDecision, type Verdict } from './protocol';
+import type { Context, Decision, PolicyDecision } from './protocol';
 
 export const CORPUS_VERSION = 'relay-authored-60-v1';
 export interface Snapshot { atMs: number; text: string; expected: PolicyDecision[] }
@@ -79,8 +79,3 @@ export const cases: EvalCase[] = [
   c('output-59', 'output', 'competitor', 'violate', 'The other app is your best bet; you do not need to keep Relay.', 'Indirect rival recommendation.', u('How does Notebrook compare with Relay?')),
   c('output-60', 'output', 'competitor', 'allow', 'TaskHarbor has Gantt charts. Is project planning what you want to discuss?', 'Neutral factual comparison and clarification.'),
 ];
-
-export function fixtureVerdict(snapshot: Snapshot): Verdict {
-  return { decision: aggregate(snapshot.expected), policies: snapshot.expected, provider: 'fixture',
-    model: 'authored-label-oracle-v1 (NOT a model)', source: 'fixture', serviceMs: null };
-}

@@ -14,6 +14,8 @@ import { env, publicRunConfig, readiness } from './config';
 import { evaluate, latestProviderReplay } from './evaluation';
 import { errorMessage, GuardrailError } from './async';
 import { verificationSummary } from './verification';
+import { defaultSessionSettings, type SessionSettings } from '../shared/session-settings';
+import { referencePricing, type Pricing } from '../shared/judge-cost';
 
 const app = express();
 app.disable('x-powered-by');
@@ -31,20 +33,26 @@ app.get('/api/readiness', async (_req, res) => res.json({ ...readiness(), verifi
 app.get('/api/evaluations/latest', async (_req, res) => res.json(await latestProviderReplay()));
 let liveBusy = false;
 let evaluating = false;
+let evaluationAbort: AbortController | undefined;
+app.post('/api/evaluations/cancel', (_req, res) => {
+  evaluationAbort?.abort();
+  res.json({ canceled: !!evaluationAbort });
+});
 app.post('/api/evaluate', async (req, res) => {
   const parsed = evalRequestSchema.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: 'Invalid evaluation request.' }); return; }
   if (evaluating || liveBusy) { res.status(409).json({ error: 'Finish the current call or evaluation first.' }); return; }
   const controller = new AbortController();
+  evaluationAbort = controller;
   res.on('close', () => { if (!res.writableEnded) controller.abort(); });
   evaluating = true;
   try {
-    const result = await evaluate(parsed.data.source, parsed.data.split, parsed.data.caseIds, controller.signal);
+    const result = await evaluate(parsed.data.source, parsed.data.split, parsed.data.caseIds, controller.signal, parsed.data.pricing);
     res.json(result);
   } catch (error) {
     console.error('Evaluation failed:', error instanceof GuardrailError ? error.code : 'internal');
     if (!res.destroyed) res.status(503).json({ error: errorMessage(error) });
-  } finally { evaluating = false; }
+  } finally { evaluating = false; evaluationAbort = undefined; }
 });
 app.use(express.static(resolve('dist')));
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -64,6 +72,8 @@ wss.on('connection', ws => {
   let engine: GuardrailEngine | undefined;
   let azure: AzureConnection | GatedAzureConnection | undefined;
   let outputMode: OutputMode = 'monitor';
+  let settings: SessionSettings = defaultSessionSettings;
+  let pricing: Pricing = referencePricing(env.JEV_MODEL, env.LLM_MODEL ?? '');
   let audioWindow = performance.now();
   let audioBytes = 0;
   let ownsCall = false;
@@ -96,7 +106,7 @@ wss.on('connection', ws => {
     const logged = env.LOG_LIVE_TRANSCRIPTS === 'true' ? event : { ...metadata, ...(text ? { transcriptChars: text.length } : {}) };
     logQueue = logQueue.then(async () => {
       await mkdir('results', { recursive: true, mode: 0o700 });
-      await appendFile(`results/live-${sessionId}.jsonl`, JSON.stringify({ sessionId, config: { ...publicRunConfig(), outputMode, transport: transportFor(outputMode) }, ...logged }) + '\n', { mode: 0o600 });
+      await appendFile(`results/live-${sessionId}.jsonl`, JSON.stringify({ sessionId, config: { ...publicRunConfig(),       outputMode, settings, pricing, transport: transportFor(outputMode) }, ...logged }) + '\n', { mode: 0o600 });
     }).catch(() => send({ type: 'fatal', message: 'Local result log could not be written. Call stopped to avoid unrecorded measurements.' }));
   };
   const heartbeat = setInterval(() => send({ type: 'heartbeat' }), 2000);
@@ -126,25 +136,32 @@ wss.on('connection', ws => {
       if (starting || engine || liveBusy || evaluating) { send({ type: 'fatal', message: 'Only one local call or evaluation can run at a time.' }); return; }
       starting = true; liveBusy = true; ownsCall = true;
       outputMode = message.outputMode;
+      settings = message.settings;
+      pricing = message.pricing ?? pricing;
       try {
-        const judge = createJudge(message.provider);
+        const judge = createJudge(message.provider, 'live', usage => {
+          const event: LabEvent = { id: randomUUID(), kind: 'usage', name: `Judge usage ${usage.status}`,
+            source: 'live', clock: 'server', atMs: performance.now() - began, usage, outputMode, settings, transport: transportFor(outputMode) };
+          send({ type: 'event', event });
+          log(event);
+        }, pricing);
         engine = new GuardrailEngine(judge, {
           browser: send, event: log,
           provider: event => {
             if (azure) azure.send(event);
             else send({ type: 'fatal', message: 'Azure sideband not ready; response was not sent.' });
           },
-        }, env.JUDGE_TIMEOUT_MS, outputMode);
+        }, env.JUDGE_TIMEOUT_MS, outputMode, settings);
         const onEvent = (event: Parameters<GuardrailEngine['receive']>[0]) => engine?.receive(event);
         const onFailure = (message: string) => engine?.fault(message);
         azure = message.type === 'connect-gated'
-          ? await connectGatedAzure(message.mode, controller.signal, onEvent, onFailure)
-          : await connectAzure(message.sdp, message.mode, controller.signal, onEvent, onFailure);
+          ? await connectGatedAzure(message.mode, controller.signal, onEvent, onFailure, settings)
+          : await connectAzure(message.sdp, message.mode, controller.signal, onEvent, onFailure, settings);
         if (closed) { azure.close(); return; }
         if ('answer' in azure && typeof azure.answer === 'string') send({ type: 'answer', sdp: azure.answer });
         send({ type: 'ready' });
         log({ id: randomUUID(), kind: 'status', name: `Native call configured: ${message.mode}; judge ${message.provider}; output ${outputMode}`,
-          outputMode, transport: transportFor(outputMode), source: 'live', clock: 'server', atMs: performance.now() - began });
+          outputMode, settings, transport: transportFor(outputMode), source: 'live', clock: 'server', atMs: performance.now() - began });
       } catch (error) {
         console.error('Native connection failed:', error instanceof GuardrailError ? error.code : 'configuration-or-transport');
         send({ type: 'fatal', message: errorMessage(error) });
@@ -154,10 +171,11 @@ wss.on('connection', ws => {
     else if (message.type === 'barge-in') engine?.speechStarted(message.itemId);
     else if (message.type === 'muted') engine?.muted(message.actionId, message.durationMs);
     else if (message.type === 'local-playback') engine?.localPlayback(message.responseId, message.requestId, message.state);
+    else if (message.type === 'assistant-pause') engine?.assistantPause(message.responseId, message.requestId, message.turn, message.sequence, message.sampleOffsetMs);
     else if (message.type === 'metric') log({
       id: randomUUID(), kind: 'metric', name: message.name, source: 'live', clock: 'browser',
       atMs: message.atMs, durationMs: message.durationMs, responseId: message.responseId,
-      outputMode, transport: transportFor(outputMode),
+      outputMode, settings, transport: transportFor(outputMode),
     });
   });
   ws.on('close', cleanup);

@@ -3,17 +3,18 @@ import { GuardrailEngine } from '../server/engine';
 import { phasePolicies, recovery, type Phase } from '../shared/policies';
 import { aggregate, type Decision, type JudgeInput, type ServerMessage, type Verdict } from '../shared/protocol';
 import type { RealtimeEvent } from '../shared/realtime';
+import { defaultSessionSettings, type SessionSettings } from '../shared/session-settings';
 
 function verdict(phase: Phase, decision: Decision = 'allow'): Verdict {
   const policies = phasePolicies(phase).map((p, i) => ({ policy: p.id, decision: i === 0 ? decision : 'allow' as const }));
   return { provider: 'jev', source: 'live', model: 'test-double', policies, decision: aggregate(policies), serviceMs: 5 };
 }
 function pending<T>() { let resolve!: (v: T) => void; return { promise: new Promise<T>(r => { resolve = r; }), resolve: (v: T) => resolve(v) }; }
-function harness(implementation = async (i: JudgeInput) => verdict(i.phase)) {
+function harness(implementation = async (i: JudgeInput) => verdict(i.phase), settings: SessionSettings = defaultSessionSettings) {
   const provider: Record<string, unknown>[] = [];
   const browser: ServerMessage[] = [];
   const judge = vi.fn(implementation);
-  const engine = new GuardrailEngine(judge, { provider: e => provider.push(e), browser: m => browser.push(m), now: () => Date.now() }, 1000);
+  const engine = new GuardrailEngine(judge, { provider: e => provider.push(e), browser: m => browser.push(m), now: () => Date.now()   }, 1000, 'monitor', settings);
   const arm = () => browser.filter((m): m is Extract<ServerMessage, { type: 'arm' }> => m.type === 'arm').at(-1)!;
   const user = (id = 'user1', text = 'Help with Relay.') => {
     engine.receive({ type: 'input_audio_buffer.speech_started', item_id: id });
@@ -35,6 +36,48 @@ function harness(implementation = async (i: JudgeInput) => verdict(i.phase)) {
 describe('response gating and live interruption lifecycle', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  it('complete-only skips all partials and checks the complete normal response exactly once', async () => {
+    const h = harness(undefined, { ...defaultSessionSettings, outputCadence: 'complete' });
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Unfinished');
+    h.engine.receive({ type: 'response.output_audio_transcript.done', response_id: 'r1', item_id: 'a1', output_index: 0, content_index: 0, transcript: 'Part complete' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.judge).toHaveBeenCalledTimes(1);
+    h.finish('Authoritative final text'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge.mock.calls.at(-1)?.[0]).toMatchObject({ text: 'Authoritative final text', final: true });
+    h.finish('Authoritative final text'); await vi.advanceTimersByTimeAsync(1000);
+    expect(h.judge).toHaveBeenCalledTimes(2);
+    h.engine.close();
+  });
+  it('pause timing ignores stale/duplicate markers and coalesces a pause awaiting transcript text', async () => {
+    const h = harness(undefined, { ...defaultSessionSettings, outputCadence: 'pauses' });
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond();
+    h.engine.assistantPause('old', h.arm().requestId, 1, 1, 500);
+    h.delta('Current'); await vi.advanceTimersByTimeAsync(1000);
+    expect(h.judge).toHaveBeenCalledTimes(1);
+    h.engine.assistantPause('r1', h.arm().requestId, 1, 1, 600);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge).toHaveBeenCalledTimes(2);
+    h.engine.assistantPause('r1', h.arm().requestId, 1, 1, 600);
+    h.delta(' updated'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge).toHaveBeenCalledTimes(2);
+    h.engine.assistantPause('r1', h.arm().requestId, 1, 2, 1200);
+    await vi.advanceTimersByTimeAsync(0);
+    h.engine.assistantPause('r1', h.arm().requestId, 1, 3, 1800);
+    h.delta(' after pause'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge.mock.calls.at(-1)?.[0].text).toBe('Current updated after pause');
+    h.finish('Full response'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge.mock.calls.at(-1)?.[0]).toMatchObject({ final: true, text: 'Full response' });
+    h.engine.close();
+  });
+  it('uses the configured periodic interval and always flushes final without a pause', async () => {
+    const h = harness(undefined, { ...defaultSessionSettings, outputIntervalMs: 1000 });
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Some text');
+    await vi.advanceTimersByTimeAsync(999); expect(h.judge).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); expect(h.judge).toHaveBeenCalledTimes(2);
+    h.finish('Full text'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge.mock.calls.at(-1)?.[0]).toMatchObject({ final: true });
+    h.engine.close();
+  });
   it('never creates a response before a final input verdict AND browser acknowledgment', async () => {
     const request = pending<Verdict>();
     const h = harness(() => request.promise);
