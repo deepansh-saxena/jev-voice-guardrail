@@ -129,15 +129,36 @@ describe('response gating and live interruption lifecycle', () => {
     h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Restricted');
     await vi.advanceTimersByTimeAsync(200);
     expect(h.provider.some(e => e.type === 'response.cancel')).toBe(true);
+    expect(h.provider.some(e => e.type === 'output_audio_buffer.clear')).toBe(false);
     const mute = h.browser.find((m): m is Extract<ServerMessage, { type: 'mute' }> => m.type === 'mute')!;
     h.engine.muted(mute.actionId, 0.2);
     h.finish('Restricted', 'cancelled');
+    expect(h.provider.filter(e => e.type === 'output_audio_buffer.clear')).toHaveLength(1);
     h.engine.receive({ type: 'output_audio_buffer.cleared', response_id: 'r1' });
     expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(1);
     h.engine.receive({ type: 'conversation.item.deleted', item_id: 'a1' });
     expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(2);
     h.engine.armed(h.arm().requestId);
     expect(h.provider.filter(p => p.type === 'response.create').at(-1)).toMatchObject({ response: { input: [] } });
+    h.engine.close();
+  });
+  it('clears only after cancellation so late generated audio cannot survive into recovery', async () => {
+    const h = harness(async i => verdict(i.phase, i.phase === 'output' ? 'violate' : 'allow'));
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Restricted');
+    await vi.advanceTimersByTimeAsync(200);
+    const mute = h.browser.find((m): m is Extract<ServerMessage, { type: 'mute' }> => m.type === 'mute')!;
+    h.engine.muted(mute.actionId, 0);
+    h.engine.receive({ type: 'output_audio_buffer.cleared', response_id: 'r1' });
+    h.engine.receive({ type: 'output_audio_buffer.started', response_id: 'r1' });
+    expect(h.provider.some(e => e.type === 'output_audio_buffer.clear')).toBe(false);
+    expect(h.provider.some(e => e.type === 'conversation.item.delete')).toBe(false);
+    h.finish('Restricted', 'cancelled');
+    h.finish('Restricted', 'cancelled');
+    expect(h.provider.filter(e => e.type === 'output_audio_buffer.clear')).toHaveLength(1);
+    h.engine.receive({ type: 'conversation.item.deleted', item_id: 'a1' });
+    expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(1);
+    h.engine.receive({ type: 'output_audio_buffer.cleared', response_id: 'r1' });
+    expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(2);
     h.engine.close();
   });
   it('ignores output verdicts superseded by user interruption and does not loop recovery', async () => {
@@ -149,6 +170,19 @@ describe('response gating and live interruption lifecycle', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(h.browser.filter(m => m.type === 'event' && m.event.name.startsWith('Output violate'))).toHaveLength(0);
     h.engine.close();
+  });
+  it('stays muted and fails closed when cancellation completion never arrives', async () => {
+    const h = harness(async i => verdict(i.phase, i.phase === 'output' ? 'violate' : 'allow'));
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Restricted');
+    await vi.advanceTimersByTimeAsync(200);
+    const mute = h.browser.find((m): m is Extract<ServerMessage, { type: 'mute' }> => m.type === 'mute')!;
+    h.engine.muted(mute.actionId, 0);
+    await vi.advanceTimersByTimeAsync(6001);
+    expect(h.browser.some(m => m.type === 'fatal')).toBe(true);
+    expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(1);
+    expect(h.provider.some(e => e.type === 'output_audio_buffer.clear')).toBe(false);
+    h.finish('Restricted', 'cancelled');
+    expect(h.browser.filter(m => m.type === 'arm')).toHaveLength(1);
   });
   it('fails closed on input timeout without counting an outage as a detection', async () => {
     const h = harness(() => new Promise(() => {})); h.user();

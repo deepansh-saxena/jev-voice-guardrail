@@ -15,7 +15,7 @@ interface Active {
   id: string; turn: number; recovery: boolean; parts: Map<string, Part>; items: Set<string>;
   deleted: Set<string>; revision: number; checked: number; offered: string;
   done: boolean; playbackStopped: boolean; interrupted: boolean; cleared: boolean;
-  muted: boolean; playbackStarted: boolean; actionId?: string; cancelId?: string; recoveryText?: string;
+  muted: boolean; playbackStarted: boolean; clearRequested: boolean; actionId?: string; cancelId?: string; recoveryText?: string;
 }
 interface Snapshot extends JudgeInput { responseId: string; revision: number; turn: number }
 interface EngineHooks {
@@ -137,7 +137,7 @@ export class GuardrailEngine {
         this.finishResponse();
         break;
       case 'output_audio_buffer.cleared':
-        if (this.active?.id !== event.response_id) break;
+        if (this.active?.id !== event.response_id || !this.active.clearRequested) break;
         this.active.cleared = true;
         this.active.playbackStopped = true;
         this.emit({ kind: 'lifecycle', name: 'Provider output buffer clear confirmed', responseId: event.response_id });
@@ -234,7 +234,7 @@ export class GuardrailEngine {
     this.pending = undefined;
     this.active = {
       id, turn: pending.turn, recovery: !!pending.recoveryText, parts: new Map(), items: new Set(), deleted: new Set(),
-      revision: 0, checked: -1, offered: '', done: false, playbackStopped: false, playbackStarted: false, interrupted: false, cleared: false, muted: false,
+      revision: 0, checked: -1, offered: '', done: false, playbackStopped: false, playbackStarted: false, interrupted: false, cleared: false, muted: false, clearRequested: false,
     };
     this.deadline('generation', 45000, 'Response generation/playback lifecycle exceeded 45 seconds.');
     this.emit({ kind: 'lifecycle', name: 'Response started', responseId: id });
@@ -296,8 +296,7 @@ export class GuardrailEngine {
     if (!active || active.id !== event.response.id) return;
     for (const [index, item] of (event.response.output ?? []).entries()) {
       active.items.add(item.id);
-      if (active.interrupted) this.deleteItem(item.id);
-      else for (const [contentIndex, part] of (item.content ?? []).entries()) {
+      if (!active.interrupted) for (const [contentIndex, part] of (item.content ?? []).entries()) {
         if (part.transcript !== undefined) this.updatePart(item.id, index, contentIndex, part.transcript, true);
       }
     }
@@ -307,7 +306,8 @@ export class GuardrailEngine {
     }
     this.emit({ kind: 'lifecycle', name: 'Generation ended; final checks/playback may still be pending', responseId: active.id });
     if (!active.interrupted && !this.text().trim()) { this.fault('Response ended without an output transcript.'); return; }
-    if (!active.interrupted) this.snapshot(true);
+    if (active.interrupted) this.clearInterruptedOutput();
+    else this.snapshot(true);
     this.finishResponse();
   }
 
@@ -325,9 +325,16 @@ export class GuardrailEngine {
       active.cancelId = randomUUID();
       this.send({ type: 'response.cancel', response_id: active.id, event_id: active.cancelId });
     }
-    this.send({ type: 'output_audio_buffer.clear' });
-    if (active.done) active.items.forEach(id => this.deleteItem(id));
+    this.clearInterruptedOutput();
     this.deadline('cleanup', 6000, 'Interruption cleanup was not confirmed. Audio stays stopped; restart the call.');
+  }
+  private clearInterruptedOutput() {
+    const active = this.active;
+    if (!active?.interrupted || !active.done || active.clearRequested) return;
+    // Clearing before generation ends can let in-flight audio refill the buffer.
+    active.clearRequested = true;
+    this.send({ type: 'output_audio_buffer.clear' });
+    active.items.forEach(id => this.deleteItem(id));
   }
   private deleteItem(id: string) {
     const active = this.active;

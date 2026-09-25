@@ -71,6 +71,7 @@ test('live mode correctly surfaces missing credentials without requesting a micr
   await page.goto('/');
   await page.getByRole('button', { name: 'Live', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Start microphone' })).toBeDisabled();
+  await expect(page.getByText('Use an existing transcription deployment name on the same Azure resource as Realtime.', { exact: false })).toBeVisible();
   await page.getByText('Required local configuration').click();
   for (const key of ['AZURE_OPENAI_API_KEY', 'AZURE_TRANSCRIPTION_DEPLOYMENT', 'JEV_API_KEY', 'LLM_BASE_URL', 'LLM_MODEL', 'LLM_API_KEY'])
     await expect(page.locator('.readiness').getByText(key, { exact: true })).toBeVisible();

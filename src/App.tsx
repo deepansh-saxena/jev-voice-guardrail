@@ -132,7 +132,7 @@ export default function App() {
               ? 'Add the remaining configuration below to the backend .env and restart the API. The microphone stays off until the input guardrail can run.'
               : 'Reading the local backend configuration. No microphone has been requested.'}</p>
               <div className="missing-settings">{missingLive.map(key => <code key={key}>{key}</code>)}</div>
-              {missingLive.includes('AZURE_TRANSCRIPTION_DEPLOYMENT') && <p>Use an existing transcription deployment name on the Sweden Central Azure resource. A realtime deployment name is not a transcription deployment.</p>}
+              {missingLive.includes('AZURE_TRANSCRIPTION_DEPLOYMENT') && <p>Use an existing transcription deployment name on the same Azure resource as Realtime. A realtime deployment name is not a transcription deployment.</p>}
               <button className="text-button" disabled={busy} onClick={() => setSource('fixture')}>Explore a simulated fixture instead <ArrowRight size={13} /></button></div>
           </section>}
           <div className="mode-banner"><FlaskConical size={18} /><div><strong>{source === 'fixture' ? 'Explore without credentials.' : 'Native Azure speech-to-speech.'}</strong> {source === 'fixture' ? 'Authored text and event playback. No microphone, recordings, model predictions or measured provider latency.' : 'Input gates response creation, not audio ingestion. Output is detect-and-interrupt, not zero leakage.'}</div><button onClick={() => setTab('replay')}>About the evidence <ArrowRight size={14} /></button></div>
