@@ -35,6 +35,15 @@ export interface Verdict {
   serviceMs: number | null;
   source: Source;
 }
+export interface JudgeFailure {
+  provider: Provider;
+  phase: Phase;
+  code: string;
+  httpStatus?: number;
+  providerCode?: string;
+  innerCode?: string;
+  filter?: 'jailbreak' | 'content';
+}
 export function aggregate(decisions: PolicyDecision[]): Decision {
   return decisions.some(d => d.decision === 'violate') ? 'violate'
     : decisions.some(d => d.decision === 'uncertain') ? 'uncertain' : 'allow';
@@ -59,6 +68,8 @@ export interface LabEvent {
   delivery?: 'held' | 'approved' | 'playing' | 'ended' | 'blocked';
   settings?: SessionSettings;
   usage?: JudgeUsage;
+  failure?: JudgeFailure;
+  recoverable?: boolean;
 }
 export interface Readiness {
   pricing?: Pricing;

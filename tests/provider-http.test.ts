@@ -39,12 +39,41 @@ describe('provider HTTP integration with in-process mocked responses', () => {
       body: expect.stringContaining('"model":"separate-judge-deployment"'),
     }));
   });
-  it.each([401, 429, 529])('surfaces HTTP %i without retry or mock fallback', async status => {
+  it.each([400, 401, 429, 529])('surfaces HTTP %i without retry or mock fallback', async status => {
     const fetch = vi.fn(async () => new Response('do not expose provider response body', { status }));
     vi.stubGlobal('fetch', fetch);
     const { createJudge } = await import('../server/judges');
     await expect(createJudge('jev')(input, new AbortController().signal)).rejects.toMatchObject({ code: `http-${status}` });
     expect(fetch).toHaveBeenCalledOnce();
+  });
+  it('retains only allowlisted filter diagnosis and counts unknown usage without a fake verdict or retry', async () => {
+    const fetch = vi.fn(async () => Response.json({ error: {
+      code: 'content_filter', message: 'PRIVATE provider echo must never leave the adapter',
+      innererror: { code: 'ResponsibleAIPolicyViolation', content_filter_result: { jailbreak: { filtered: true, detected: true } } },
+    } }, { status: 400 }));
+    vi.stubGlobal('fetch', fetch);
+    const { createJudge } = await import('../server/judges');
+    const usage: unknown[] = [];
+    const error = await createJudge('llm', 'live', record => usage.push(record))(input, new AbortController().signal).catch(e => e);
+    expect(error.failure).toEqual({ provider: 'llm', phase: 'input', code: 'http-400', httpStatus: 400,
+      providerCode: 'content_filter', innerCode: 'ResponsibleAIPolicyViolation', filter: 'jailbreak' });
+    expect(error.message).toContain('No Relay policy verdict');
+    expect(JSON.stringify({ error, usage })).not.toContain('PRIVATE');
+    expect(usage.at(-1)).toMatchObject({ status: 'unavailable', usage: null, estimatedUsd: null });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+  it('does not guess filtering or expose unknown error codes, raw text or oversized bodies', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(Response.json({ error: { code: 'private-secret-code', message: 'PRIVATE' } }, { status: 400 }))
+      .mockResolvedValueOnce(new Response('PRIVATE'.repeat(5000), { status: 400 })));
+    const { createJudge } = await import('../server/judges');
+    for (let i = 0; i < 2; i++) {
+      const error = await createJudge('llm')(input, new AbortController().signal).catch(e => e);
+      expect(error.failure).toEqual({ provider: 'llm', phase: 'input', code: 'http-400', httpStatus: 400 });
+      expect(error.message).not.toContain('filter');
+      expect(JSON.stringify(error)).not.toContain('private-secret-code');
+      expect(JSON.stringify(error)).not.toContain('PRIVATE');
+    }
   });
   it('surfaces network and malformed response errors explicitly', async () => {
     const fetch = vi.fn().mockRejectedValueOnce(new Error('do not expose transport URL')).mockResolvedValueOnce(new Response('bad json'));

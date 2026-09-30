@@ -3,7 +3,7 @@ import { MAX_TEXT, recovery, type PolicyId } from '../shared/policies';
 import { transportFor, type Context, type JudgeInput, type LabEvent, type OutputMode, type ServerMessage, type Verdict } from '../shared/protocol';
 import { audioPartKey, decodePcm, MAX_OUTPUT_SECONDS, PcmResponseBuffer, type AudioPartId } from '../shared/audio';
 import type { RealtimeEvent } from '../shared/realtime';
-import { bounded, CoalescingScheduler, errorMessage } from './async';
+import { bounded, CoalescingScheduler, errorMessage, GuardrailError } from './async';
 import type { Judge } from './judges';
 import { cadenceDescription, defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
 import { AudioPauseDetector } from '../shared/audio-pause';
@@ -49,8 +49,8 @@ export class GuardrailEngine {
   private startedAt: number;
   private scheduler: CoalescingScheduler<Snapshot, Verdict>;
 
-  constructor(private judge: Judge, private hooks: EngineHooks, private timeoutMs: number, private outputMode: OutputMode = 'monitor',
-    private settings: SessionSettings = defaultSessionSettings) {
+  constructor(private judge: Judge, private hooks: EngineHooks, timeoutMs: number, private outputMode: OutputMode = 'monitor',
+    private settings: SessionSettings = defaultSessionSettings, private inputTimeoutMs = timeoutMs) {
     this.settings = sessionSettingsSchema.parse(settings);
     this.now = hooks.now ?? (() => performance.now());
     this.startedAt = this.now();
@@ -60,7 +60,9 @@ export class GuardrailEngine {
         return this.judge(snapshot, signal);
       },
       (snapshot, verdict) => this.outputVerdict(snapshot, verdict),
-      (_snapshot, error) => this.fault(errorMessage(error)),
+      (snapshot, error) => this.fault(errorMessage(error), {
+        phase: 'output', responseId: snapshot.responseId, failure: error instanceof GuardrailError ? error.failure : undefined,
+      }),
       settings.outputCadence === 'periodic' ? settings.outputIntervalMs : 0, timeoutMs, this.now,
     );
     if (settings.outputCadence === 'periodic') this.tick = setInterval(() => this.snapshot(false), settings.outputIntervalMs);
@@ -191,7 +193,7 @@ export class GuardrailEngine {
     this.inputAbort = new AbortController();
     try {
       const verdict = await bounded(signal => this.judge({ phase: 'input', text: transcript, recentContext: context, final: true }, signal),
-        this.timeoutMs, this.inputAbort.signal);
+        this.inputTimeoutMs, this.inputAbort.signal);
       if (this.disposed || epoch !== this.epoch) return;
       this.emit({ kind: 'check-end', name: `Input ${verdict.decision}`, phase: 'input', verdict });
       if (verdict.decision === 'allow') {
@@ -205,7 +207,12 @@ export class GuardrailEngine {
         this.requestResponse(recovery[policy ?? 'uncertain']);
       }
     } catch (error) {
-      if (!this.disposed && epoch === this.epoch) this.fault(errorMessage(error));
+      if (!this.disposed && epoch === this.epoch) {
+        this.emit({ kind: 'error', phase: 'input', recoverable: true,
+          name: `${errorMessage(error)} This turn was not answered. Ask a new Relay question, or stop to change judge settings.`,
+          failure: error instanceof GuardrailError ? error.failure : undefined });
+        this.emit({ kind: 'status', name: 'Input not evaluated; listening for a new question' });
+      }
     }
   }
 
@@ -368,7 +375,12 @@ export class GuardrailEngine {
     }
     active.done = true;
     if (!active.interrupted && event.response.status !== 'completed') {
-      this.fault(`Azure generation ended with status ${event.response.status}; not a guardrail detection.`); return;
+      const reason = event.response.status_details?.reason;
+      const detail = reason === 'max_output_tokens'
+        ? 'Voice output token limit reached. Increase AZURE_MAX_OUTPUT_TOKENS or request a shorter answer.'
+        : reason === 'content_filter' ? 'Azure content filter stopped generation.'
+        : 'Provider did not supply a recognized completion reason.';
+      this.fault(`Azure generation ended with status ${event.response.status}. ${detail} Incomplete audio was not approved; not a guardrail detection.`, { responseId: active.id }); return;
     }
     this.emit({ kind: 'lifecycle', name: 'Generation ended; final checks/playback may still be pending', responseId: active.id });
     if (!active.interrupted && !this.text().trim()) { this.fault('Response ended without an output transcript.'); return; }
@@ -492,9 +504,9 @@ export class GuardrailEngine {
     if (deferred && deferred.turn === this.turn?.number) this.requestResponse(deferred.recoveryText);
     else if (active.recoveryText && active.turn === this.turn?.number) this.requestResponse(active.recoveryText);
   }
-  fault(message: string) {
+  fault(message: string, detail: Pick<LabEvent, 'phase' | 'responseId' | 'failure'> = {}) {
     if (this.disposed) return;
-    this.emit({ kind: 'error', name: message });
+    this.emit({ kind: 'error', name: message, ...detail });
     if (this.active && !this.active.interrupted) this.interrupt('Guardrail unavailable; not a policy detection');
     this.hooks.browser({ type: 'fatal', message });
     this.close();

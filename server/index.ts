@@ -5,7 +5,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { clientMessageSchema, evalRequestSchema, transportFor, type LabEvent, type OutputMode, type ServerMessage } from '../shared/protocol';
-import { decodePcm } from '../shared/audio';
+import { PcmInputLimiter } from './pcm-input';
 import { GuardrailEngine } from './engine';
 import { connectAzure, type AzureConnection } from './azure';
 import { connectGatedAzure, type GatedAzureConnection } from './azure-gated';
@@ -74,8 +74,7 @@ wss.on('connection', ws => {
   let outputMode: OutputMode = 'monitor';
   let settings: SessionSettings = defaultSessionSettings;
   let pricing: Pricing = referencePricing(env.JEV_MODEL, env.LLM_MODEL ?? '');
-  let audioWindow = performance.now();
-  let audioBytes = 0;
+  const audioInput = new PcmInputLimiter();
   let ownsCall = false;
   let closed = false;
   let starting = false;
@@ -123,12 +122,15 @@ wss.on('connection', ws => {
     if (message.type === 'audio-input') {
       if (outputMode !== 'gated' || !azure || !engine) { send({ type: 'fatal', message: 'Native audio arrived before gated session readiness.' }); return; }
       try {
-        const bytes = decodePcm(message.data);
-        if (now - audioWindow >= 1000) { audioWindow = now; audioBytes = 0; }
-        audioBytes += bytes.byteLength;
-        if (bytes.byteLength > 4800 || audioBytes > 72000) throw new Error('Audio input rate limit.');
-        azure.send({ type: 'input_audio_buffer.append', audio: message.data });
-      } catch { send({ type: 'fatal', message: 'Invalid or excessive native PCM input. Call stopped.' }); }
+        audioInput.accept(message.data);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Native PCM input validation failed. Call stopped.';
+        log({ id: randomUUID(), kind: 'error', name: reason, source: 'live', clock: 'server',
+          atMs: performance.now() - began, outputMode, transport: transportFor(outputMode) });
+        send({ type: 'fatal', message: reason });
+        return;
+      }
+      azure.send({ type: 'input_audio_buffer.append', audio: message.data });
       return;
     }
     if (++messages > 240) { send({ type: 'fatal', message: 'Local message rate limit exceeded.' }); return; }
@@ -151,7 +153,7 @@ wss.on('connection', ws => {
             if (azure) azure.send(event);
             else send({ type: 'fatal', message: 'Azure sideband not ready; response was not sent.' });
           },
-        }, env.JUDGE_TIMEOUT_MS, outputMode, settings);
+        }, outputMode === 'gated' ? env.GATED_JUDGE_TIMEOUT_MS : env.JUDGE_TIMEOUT_MS, outputMode, settings, env.INPUT_JUDGE_TIMEOUT_MS);
         const onEvent = (event: Parameters<GuardrailEngine['receive']>[0]) => engine?.receive(event);
         const onFailure = (message: string) => engine?.fault(message);
         azure = message.type === 'connect-gated'

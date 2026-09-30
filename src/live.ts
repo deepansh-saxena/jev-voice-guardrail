@@ -226,6 +226,10 @@ export class LiveCall {
   }
   private send(message: ClientMessage) { if (!this.stopped && this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message)); }
   private setMuted(value: boolean) {
+    if (value && !this.muted && this.responseId) this.callbacks.event({
+      id: crypto.randomUUID(), source: 'live', clock: 'browser', kind: 'lifecycle',
+      name: 'Browser playback muted', responseId: this.responseId, atMs: performance.now() - this.startAt,
+    });
     this.muted = value;
     if (this.outputGain) this.outputGain.gain.value = value ? 0 : 1;
     if (value) this.pauseNode?.port.postMessage({ pauseMs: this.settings.assistantPauseMs });

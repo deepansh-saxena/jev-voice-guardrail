@@ -12,7 +12,7 @@ export function sessionConfig(mode: AgentMode, settings: SessionSettings = defau
     type: 'realtime', model: azureDeployment,
     instructions: agentInstructions(mode),
     output_modalities: ['audio'],
-    max_output_tokens: 400,
+    max_output_tokens: env.AZURE_MAX_OUTPUT_TOKENS,
     tools: [],
     audio: {
       input: {
@@ -65,7 +65,7 @@ export async function connectAzure(
     const text = await result.text();
     if (!text.startsWith('v=0') || text.length > 100000) throw new GuardrailError('azure-sdp', 'Azure returned an invalid SDP answer.');
     return { sdp: text, callId };
-  }, 25000, signal);
+  }, 25000, signal, 'Azure voice setup');
 
   const wsUrl = new URL(base);
   wsUrl.protocol = 'wss:';
@@ -120,7 +120,7 @@ export async function connectAzure(
         if (!configured) reject(new GuardrailError('azure-sideband', 'Azure sideband closed before input-gate confirmation.'));
         else if (!closed) onFailure('Azure sideband disconnected. Guardrail unavailable.');
       });
-    }), 12000, signal);
+    }), 12000, signal, 'Azure sideband setup');
   } catch (error) { close(); throw error; }
   if (signal.aborted) { close(); throw new GuardrailError('aborted', 'Call setup canceled.'); }
   return {

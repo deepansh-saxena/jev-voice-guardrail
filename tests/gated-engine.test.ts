@@ -52,6 +52,17 @@ function harness(judge: Judge = async input => verdict(input.phase), settings: S
 describe('whole-response native output gate', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  it('reports token exhaustion and never releases incomplete audio', async () => {
+    const h = harness(); h.user(); await vi.advanceTimersByTimeAsync(0); h.response();
+    h.audio(); h.text();
+    h.engine.receive({ type: 'response.done', response: {
+      id: 'r1', status: 'incomplete', status_details: { reason: 'max_output_tokens' },
+    } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.released()).toHaveLength(0);
+    expect(h.browser.some(e => e.type === 'fatal' && e.message.includes('Voice output token limit reached'))).toBe(true);
+    h.engine.close();
+  });
   it('checks acoustic pauses in held PCM but cannot release until its separate final allow', async () => {
     const seen: JudgeInput[] = [];
     const h = harness(async input => { seen.push(input); return verdict(input.phase); }, { ...defaultSessionSettings, outputCadence: 'pauses' });

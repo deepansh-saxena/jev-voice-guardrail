@@ -13,15 +13,18 @@ export interface GuardrailIncident {
 export interface GuardrailHistory {
   incidents: GuardrailIncident[];
   inputChecks: Record<string, LabEvent>;
+  inputFailures: Record<string, LabEvent>;
   inputTranscripts: Record<string, LabEvent>;
   playback: Record<string, Playback>;
   outputPauses: Record<string, LabEvent>;
   latestError?: LabEvent;
 }
-export const emptyHistory = (): GuardrailHistory => ({ incidents: [], inputChecks: {}, inputTranscripts: {}, playback: {}, outputPauses: {} });
+export const emptyHistory = (): GuardrailHistory => ({ incidents: [], inputChecks: {}, inputFailures: {}, inputTranscripts: {}, playback: {}, outputPauses: {} });
 const turnKey = (event: LabEvent) => `${event.source}:${event.turn ?? event.id}`;
 const responseKey = (event: LabEvent) => `${event.source}:${event.responseId ?? event.id}`;
 export const inputCheckFor = (history: GuardrailHistory, event: LabEvent) => history.inputChecks[turnKey(event)];
+export const inputFailureFor = (history: GuardrailHistory, event: LabEvent) => history.inputFailures[turnKey(event)];
+export const failureLabel = (event: LabEvent) => event.failure?.filter ? 'PROVIDER FILTERED - NOT A POLICY VERDICT' : 'INPUT NOT EVALUATED';
 export const inputTextFor = (history: GuardrailHistory, event: LabEvent) => history.inputTranscripts[turnKey(event)]?.text;
 export const outputPauseFor = (history: GuardrailHistory, event: LabEvent) => history.outputPauses[responseKey(event)];
 const violatedPolicies = (event: LabEvent) => policies.filter(p => p.phase === event.phase
@@ -40,7 +43,8 @@ export function appendHistory(history: GuardrailHistory, event: LabEvent): Guard
     && ((event.kind === 'check-end' && event.phase === 'output' && event.verdict?.decision !== undefined && event.verdict.decision !== 'allow')
       || event.kind === 'interrupt'))
     next = { ...next, outputPauses: { ...next.outputPauses, [responseKey(event)]: event } };
-  if (event.kind === 'error') return { ...next, latestError: event };
+  if (event.kind === 'error') return { ...next, latestError: event,
+    ...(event.phase === 'input' ? { inputFailures: { ...next.inputFailures, [turnKey(event)]: event } } : {}) };
   if (event.kind === 'transcript' && event.role === 'user')
     return { ...next, inputTranscripts: { ...next.inputTranscripts, [turnKey(event)]: event } };
   // Existing control acknowledgments have names; incident identity comes from verdicts and turn/response IDs.

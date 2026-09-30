@@ -14,6 +14,7 @@ export const env = z.object({
   AZURE_OPENAI_API_KEY: optional,
   AZURE_TRANSCRIPTION_DEPLOYMENT: optional,
   AZURE_VOICE: z.string().default('marin'),
+  AZURE_MAX_OUTPUT_TOKENS: number(2048, 1, 4096),
   JEV_API_KEY: optional,
   JEV_MODEL: z.string().default('jev-1.13.0'),
   JEV_MIN_PROBABILITY: number(0.8, 0.5, 1),
@@ -24,6 +25,8 @@ export const env = z.object({
   LLM_REASONING_EFFORT: z.preprocess(empty, z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional()),
   LLM_MAX_COMPLETION_TOKENS: number(1024, 128, 8192),
   JUDGE_TIMEOUT_MS: number(4000, 100, 30000),
+  INPUT_JUDGE_TIMEOUT_MS: number(10000, 100, 30000),
+  GATED_JUDGE_TIMEOUT_MS: number(10000, 100, 30000),
   JUDGE_MAX_REQUESTS_PER_MINUTE: number(240, 1, 1200),
   LOG_LIVE_TRANSCRIPTS: z.enum(['true', 'false']).default('false'),
 }).parse(process.env);
@@ -57,6 +60,8 @@ export function readiness(): Readiness {
 export function publicRunConfig() {
   return {
     ...readiness().config,
+    inputJudgeTimeoutMs: env.INPUT_JUDGE_TIMEOUT_MS, gatedJudgeTimeoutMs: env.GATED_JUDGE_TIMEOUT_MS,
+    maxOutputTokens: env.AZURE_MAX_OUTPUT_TOKENS,
     realtime: { endpoint: env.AZURE_REALTIME_ENDPOINT, deployment: azureDeployment, transcriptionDeployment: env.AZURE_TRANSCRIPTION_DEPLOYMENT ?? null, voice: env.AZURE_VOICE, automaticResponses: false, automaticInterruption: false },
     schedulerVersion: 'single-flight-coalescing-v1',
     localRequestsPerMinute: env.JUDGE_MAX_REQUESTS_PER_MINUTE,

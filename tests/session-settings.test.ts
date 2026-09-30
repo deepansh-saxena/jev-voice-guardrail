@@ -35,6 +35,7 @@ it('wires the same custom user silence and disabled response gates through both 
     type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 1200,
     create_response: false, interrupt_response: false,
   } } } } });
+  expect(sessionConfig('normal').max_output_tokens).toBe(2048);
   expect(sessionConfig('stress').audio.input.turn_detection.silence_duration_ms).toBe(500);
   expect(() => sessionConfig('normal', { ...settings, inputSilenceMs: NaN })).toThrow();
   rtc.close(); pcm.close(); expect(fail).not.toHaveBeenCalled();

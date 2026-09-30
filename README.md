@@ -56,7 +56,10 @@ test artifacts and build output are excluded from Git.
 | `LLM_AUTH` | `bearer` for OpenAI, or resource `api-key` for Azure |
 | `LLM_REASONING_EFFORT` | Optional, only a setting supported by the selected judge |
 | `LLM_MAX_COMPLETION_TOKENS` | Default `1024`, including any reasoning budget |
-| `JUDGE_TIMEOUT_MS` | Default `4000` |
+| `JUDGE_TIMEOUT_MS` | Monitor output/replay deadline; default `4000` |
+| `INPUT_JUDGE_TIMEOUT_MS` | Live input deadline; default `10000` |
+| `GATED_JUDGE_TIMEOUT_MS` | Held-output deadline; default `10000` |
+| `AZURE_MAX_OUTPUT_TOKENS` | Native response token budget; default `2048` |
 | `JUDGE_MAX_REQUESTS_PER_MINUTE` | Default `240` per provider |
 | `LOG_LIVE_TRANSCRIPTS` | Default `false`; explicit local opt-in to transcript logging |
 
@@ -174,6 +177,19 @@ turn. Input violation uses a fixed policy-specific redirect; uncertainty uses a
 fixed clarification. Both are constrained native responses with no tools or
 rejected user input, and use the same output cadence/delivery checks.
 User audio has already reached Azure: this gates responses, not ingestion.
+
+An **input judge failure** is not an allow, violation or uncertainty verdict.
+That turn receives no answer, automatic retry or spoken fallback; the microphone
+session remains available for a new question, which must pass its own input check.
+Failed input is not added to approved conversation references or judge context.
+An upstream `content_filter` rejection is shown separately as **PROVIDER FILTERED -
+NOT A POLICY VERDICT**, with allowlisted provider/phase/error codes, never the raw
+provider response. For example, an Azure jailbreak filter can reject text sent
+for classification before the LLM judge produces any Relay policy decision.
+The app does not bypass that filter or count it as a successful policy detection.
+Output judge failures and unsafe transport/cleanup faults still stop audio and
+the call. Authentication/deployment errors require stopping to fix settings;
+repeating an unchanged rejected request is not an automatic recovery strategy.
 
 Interruption mutes/discards immediately, cancels active generation, waits for
 `response.done`, and then reconciles context. Streaming clears the provider
@@ -332,6 +348,7 @@ is text-scheduler timing, not end-to-end microphone-to-speaker performance.
 | Native transcription error | Voice and transcription deployment must be on the same Azure resource; a project URL or unrelated transcription resource is not interchangeable |
 | Judge auth/model error | Check `LLM_AUTH`, matching endpoint/key and supported deployment, structured-output support and optional reasoning setting; realtime is not automatically a chat-completions judge |
 | Needs clarification / uncertain output | Inspect the actual policy probability/decision; incomplete phrases can cause abstention. Complete-only timing is an explicit alternative, not an automatic threshold bypass |
+| Input not evaluated / provider filtered | No answer was authorized for that turn. Read the provider/phase/error code in Guardrail activity; ask a new Relay question, or Stop to correct judge configuration. A provider filter is not a Relay policy verdict |
 | Gate discards or times out | Audio/transcript completion must match and remain within the 30-second limit. Missing data or failed cleanup stops the call rather than releasing an incomplete answer |
 | Cost is partial / unavailable | Provider usage or required prices/cache details were absent. A canceled/failed call is not necessarily free; enter verified custom Azure prices if known |
 
@@ -391,3 +408,30 @@ Primary contracts: [Azure WebRTC](https://learn.microsoft.com/en-us/azure/foundr
 [VAD guide](https://developers.openai.com/api/docs/guides/realtime-vad),
 [Azure v1 authentication](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle).
 Azure resource credentials stay backend-only; no resources are provisioned.
+
+### Conversation display timing
+
+Assistant conversation text stays hidden until the browser detects output audio
+for that response. Gated responses reveal their available transcript when approved
+audio starts, while monitor responses update during playback. Muting or interrupting
+a response freezes its displayed text. Input transcripts still appear immediately.
+This is playback-triggered display, not word-level alignment: the provider does
+not supply word timestamps, and the available text can run ahead of speech.
+Generated evidence remains available to guardrail checks and JSON exports.
+
+### Provider reliability
+
+Live input and held-output judging allow 10 seconds for provider latency spikes.
+Monitor output checks retain the 4-second deadline because audio may already be
+playing. These are deadlines, not added delays; completed checks return immediately.
+Native voice responses use a 2048-token budget (previously 400) and are prompted
+to stay under 60 words. The 30-second PCM limit remains enforced. Token exhaustion
+is a suspected cause of earlier incomplete responses; those historical logs did
+not retain completion reasons. New errors distinguish token exhaustion, provider
+filtering, unknown completion reasons, and Azure connection setup timeouts.
+Incomplete responses still stop the call and never release held audio.
+
+Native microphone input is limited to 48,000 PCM bytes/second (24 kHz mono,
+16-bit), with a capped two-second burst allowance for browser/server scheduling
+jitter. Individual chunks remain limited to 100 ms. Malformed chunks, oversized
+chunks and excessive backlog produce distinct errors recorded without audio.

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { judgeInstructions, knowledge, MAX_TEXT, phasePolicies } from '../shared/policies';
-import { aggregate, contextSchema, decisionSchema, type JudgeInput, type Provider, type PolicyDecision, type Verdict, type Source } from '../shared/protocol';
+import { aggregate, contextSchema, decisionSchema, type JudgeInput, type JudgeFailure, type Provider, type PolicyDecision, type Verdict, type Source } from '../shared/protocol';
 import { env, readiness } from './config';
 import { GuardrailError } from './async';
 import { randomUUID } from 'node:crypto';
@@ -84,13 +84,56 @@ export function parseLlm(value: unknown, input: JudgeInput): { model: string; po
 
 const active: Record<Provider, number> = { jev: 0, llm: 0 };
 const starts: Record<Provider, number[]> = { jev: [], llm: [] };
-async function jsonRequest(url: string, headers: Record<string, string>, body: unknown, signal: AbortSignal): Promise<unknown> {
+async function httpFailure(res: Response, provider: Provider, phase: JudgeInput['phase']): Promise<GuardrailError> {
+  const failure: JudgeFailure = { provider, phase, code: `http-${res.status}`, httpStatus: res.status };
+  // Never retain arbitrary provider messages, URLs, request echoes or headers.
+  const reader = res.body?.getReader();
+  if (reader) {
+    try {
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 16384) break;
+        chunks.push(value);
+      }
+      if (size <= 16384) {
+        const parsed = z.object({ error: z.object({
+          code: z.string().optional(),
+          innererror: z.object({
+            code: z.string().optional(),
+            content_filter_result: z.object({ jailbreak: z.object({ filtered: z.boolean().optional() }).optional() }).optional(),
+          }).optional(),
+        }) }).safeParse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        if (parsed.success) {
+          const error = parsed.data.error;
+          if (['content_filter', 'invalid_request_error', 'DeploymentNotFound', 'model_not_found', 'unsupported_parameter', 'invalid_parameter'].includes(error.code ?? ''))
+            failure.providerCode = error.code;
+          if (error.innererror?.code === 'ResponsibleAIPolicyViolation') failure.innerCode = error.innererror.code;
+          if (error.code === 'content_filter') failure.filter = error.innererror?.content_filter_result?.jailbreak?.filtered ? 'jailbreak' : 'content';
+        }
+      }
+    } catch {
+      // The HTTP failure remains explicit even when its optional diagnostic body is unreadable.
+    } finally { await reader.cancel().catch(() => { /* HTTP failure is still reported below. */ }); }
+  }
+  const name = provider === 'llm' ? 'LLM judge' : 'Jev';
+  const reason = failure.filter
+    ? `${name} provider content filter rejected this ${phase} check${failure.filter === 'jailbreak' ? ' (jailbreak detected)' : ''}. No Relay policy verdict was returned.`
+    : `${name} ${phase} check unavailable: provider HTTP ${res.status}${failure.providerCode ? ` (${failure.providerCode})` : ''}. No policy verdict was returned.`;
+  const action = res.status === 401 || res.status === 403 ? ' Stop and check the judge credentials.'
+    : res.status === 400 && !failure.filter ? ' Check the judge deployment and supported request settings.' : '';
+  return new GuardrailError(failure.code, `${reason}${action} No automatic retry.`, failure);
+}
+async function jsonRequest(url: string, headers: Record<string, string>, body: unknown, signal: AbortSignal,
+  provider: Provider, phase: JudgeInput['phase']): Promise<unknown> {
   let res: Response;
   try { res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal, redirect: 'error' }); }
   catch { throw new GuardrailError('network', 'Guardrail unavailable: provider connection failed or was aborted.'); }
   if (!res.ok) {
-    await res.body?.cancel();
-    throw new GuardrailError(`http-${res.status}`, `Guardrail unavailable: provider HTTP ${res.status}. No automatic retry.`);
+    throw await httpFailure(res, provider, phase);
   }
   if (!res.body) throw new GuardrailError('empty', 'Guardrail unavailable: empty provider response.');
   const reader = res.body.getReader();
@@ -134,11 +177,11 @@ export function createJudge(provider: Provider, source: Source = 'live', account
       let data: unknown;
       if (provider === 'jev') {
         data = await jsonRequest('https://api.typesafe.ai/v1/systemone',
-          { Authorization: `Bearer ${env.JEV_API_KEY!}`, 'Content-Type': 'application/json' },           payload, signal);
+          { Authorization: `Bearer ${env.JEV_API_KEY!}`, 'Content-Type': 'application/json' }, payload, signal, provider, input.phase);
       } else {
         const auth: Record<string, string> = env.LLM_AUTH === 'api-key' ? { 'api-key': env.LLM_API_KEY! } : { Authorization: `Bearer ${env.LLM_API_KEY!}` };
         data = await jsonRequest(`${env.LLM_BASE_URL!.replace(/\/$/, '')}/chat/completions`,
-          { ...auth, 'Content-Type': 'application/json' }, payload, signal);
+          { ...auth, 'Content-Type': 'application/json' }, payload, signal, provider, input.phase);
       }
       record.usage = reportedUsage(provider, data);
       record.status = record.usage ? 'reported' : 'unavailable';
@@ -148,10 +191,13 @@ export function createJudge(provider: Provider, source: Source = 'live', account
       record.model = normalized.model;
       return { ...normalized, decision: aggregate(normalized.policies), provider, source, serviceMs: performance.now() - start };
     } catch (error) {
-      if (error instanceof GuardrailError) throw error;
+      if (error instanceof GuardrailError) {
+        record.warning = `${error.message} Token usage unavailable; the request may still be billed.`;
+        throw error.failure ? error : new GuardrailError(error.code, error.message, { provider, phase: input.phase, code: error.code });
+      }
       throw new GuardrailError('malformed', 'Guardrail unavailable: malformed, refused, incomplete or unreadable provider result.');
     } finally {
-      if (record.status === 'pending') { record.status = 'unavailable'; record.warning = 'Request ended without reported usage; it may still be billed.'; }
+      if (record.status === 'pending') { record.status = 'unavailable'; record.warning ??= 'Request ended without reported usage; it may still be billed.'; }
       report();
       active[provider]--;
     }

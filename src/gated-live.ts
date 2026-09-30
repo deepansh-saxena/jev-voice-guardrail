@@ -43,6 +43,10 @@ export class GatedLiveCall {
       await context.audioWorklet.addModule(workletUrl);
       if (this.stopped) return;
       this.player = new GatedPlayer(context, {
+        cancelled: identity => this.callbacks.event({
+          id: crypto.randomUUID(), source: 'live', clock: 'browser', kind: 'lifecycle',
+          name: 'Browser playback muted', responseId: identity.responseId, atMs: performance.now() - this.began,
+        }),
         started: identity => {
           this.send({ type: 'local-playback', state: 'started', responseId: identity.responseId, requestId: identity.requestId });
           this.callbacks.status('Approved output playing');

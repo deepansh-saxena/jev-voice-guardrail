@@ -71,7 +71,7 @@ export async function connectGatedAzure(
         if (!configured) reject(new GuardrailError('azure-gated-closed', 'Native PCM connection closed before configuration.'));
         else if (!closed) onFailure('Native PCM connection closed. Buffered speech discarded.');
       });
-    }), 20000, signal);
+    }), 20000, signal, 'Azure native audio setup');
   } catch (error) { close(); throw error; }
   if (signal.aborted) { close(); throw new GuardrailError('aborted', 'Native PCM connection canceled.'); }
   return {

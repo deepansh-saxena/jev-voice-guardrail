@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GuardrailEngine } from '../server/engine';
 import { phasePolicies, recovery, type Phase } from '../shared/policies';
-import { aggregate, type Decision, type JudgeInput, type ServerMessage, type Verdict } from '../shared/protocol';
+import { aggregate, type Decision, type JudgeInput, type OutputMode, type ServerMessage, type Verdict } from '../shared/protocol';
+import { GuardrailError } from '../server/async';
 import type { RealtimeEvent } from '../shared/realtime';
 import { defaultSessionSettings, type SessionSettings } from '../shared/session-settings';
 
@@ -10,11 +11,11 @@ function verdict(phase: Phase, decision: Decision = 'allow'): Verdict {
   return { provider: 'jev', source: 'live', model: 'test-double', policies, decision: aggregate(policies), serviceMs: 5 };
 }
 function pending<T>() { let resolve!: (v: T) => void; return { promise: new Promise<T>(r => { resolve = r; }), resolve: (v: T) => resolve(v) }; }
-function harness(implementation = async (i: JudgeInput) => verdict(i.phase), settings: SessionSettings = defaultSessionSettings) {
+function harness(implementation = async (i: JudgeInput) => verdict(i.phase), settings: SessionSettings = defaultSessionSettings, outputMode: OutputMode = 'monitor') {
   const provider: Record<string, unknown>[] = [];
   const browser: ServerMessage[] = [];
   const judge = vi.fn(implementation);
-  const engine = new GuardrailEngine(judge, { provider: e => provider.push(e), browser: m => browser.push(m), now: () => Date.now()   }, 1000, 'monitor', settings);
+  const engine = new GuardrailEngine(judge, { provider: e => provider.push(e), browser: m => browser.push(m), now: () => Date.now()   }, 1000, outputMode, settings);
   const arm = () => browser.filter((m): m is Extract<ServerMessage, { type: 'arm' }> => m.type === 'arm').at(-1)!;
   const user = (id = 'user1', text = 'Help with Relay.') => {
     engine.receive({ type: 'input_audio_buffer.speech_started', item_id: id });
@@ -230,9 +231,55 @@ describe('response gating and live interruption lifecycle', () => {
   it('fails closed on input timeout without counting an outage as a detection', async () => {
     const h = harness(() => new Promise(() => {})); h.user();
     await vi.advanceTimersByTimeAsync(1001);
-    expect(h.browser.some(m => m.type === 'fatal')).toBe(true);
+    expect(h.browser.some(m => m.type === 'fatal')).toBe(false);
+    expect(h.browser.some(m => m.type === 'event' && m.event.kind === 'error' && m.event.recoverable)).toBe(true);
     expect(h.provider.some(e => e.type === 'response.create')).toBe(false);
     expect(h.browser.some(m => m.type === 'event' && m.event.kind === 'check-end')).toBe(false);
+    h.engine.close();
+  });
+  it.each(['monitor', 'gated'] as const)('%s: input HTTP 400 withholds this turn and independently gates the next turn', async outputMode => {
+    const h = harness(async input => {
+      if (input.text === 'Rejected test input') throw new GuardrailError('http-400', 'Provider filter rejected input.', {
+        provider: 'llm', phase: 'input', code: 'http-400', httpStatus: 400, providerCode: 'content_filter', filter: 'jailbreak',
+      });
+      return verdict(input.phase);
+    }, defaultSessionSettings, outputMode);
+    h.user('rejected', 'Rejected test input'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.browser.some(m => m.type === 'fatal' || m.type === 'arm' || m.type === 'audio-release')).toBe(false);
+    expect(h.provider).toEqual([]);
+    expect(h.browser.find(m => m.type === 'event' && m.event.kind === 'error')).toMatchObject({
+      event: { phase: 'input', turn: 1, recoverable: true, failure: { providerCode: 'content_filter' } },
+    });
+    h.user('rejected', 'Rejected test input'); await vi.advanceTimersByTimeAsync(100);
+    expect(h.judge).toHaveBeenCalledTimes(1);
+    h.user('new', 'Help with Relay'); await vi.advanceTimersByTimeAsync(0);
+    expect(h.judge.mock.calls.at(-1)?.[0].recentContext).toEqual([]);
+    h.engine.armed(h.arm().requestId);
+    expect(h.provider).toEqual([expect.objectContaining({ type: 'response.create', response: expect.objectContaining({ input: [{ type: 'item_reference', id: 'new' }] }) })]);
+    expect(h.browser.some(m => m.type === 'audio-release')).toBe(false);
+    h.engine.close();
+  });
+  it('ignores a stale input failure after a new input turn supersedes it', async () => {
+    let reject!: (error: Error) => void;
+    const h = harness(i => i.text === 'Slow input' ? new Promise((_resolve, r) => { reject = r; }) : Promise.resolve(verdict(i.phase)));
+    h.user('old', 'Slow input'); await vi.advanceTimersByTimeAsync(0);
+    h.user('new'); await vi.advanceTimersByTimeAsync(0);
+    reject(new GuardrailError('http-400', 'Late error')); await vi.advanceTimersByTimeAsync(0);
+    expect(h.browser.some(m => m.type === 'event' && m.event.kind === 'error')).toBe(false);
+    expect(h.arm().turn).toBe(2);
+    h.engine.close();
+  });
+  it.each(['monitor', 'gated'] as const)('%s: output HTTP failures remain fatal and never release unchecked audio', async outputMode => {
+    const h = harness(async i => {
+      if (i.phase === 'output') throw new GuardrailError('http-400', 'Output request rejected.', { provider: 'llm', phase: 'output', code: 'http-400' });
+      return verdict(i.phase);
+    }, defaultSessionSettings, outputMode);
+    h.user(); await vi.advanceTimersByTimeAsync(0); h.respond(); h.delta('Unapproved output');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.browser.some(m => m.type === 'fatal')).toBe(true);
+    expect(h.browser.some(m => m.type === 'audio-release')).toBe(false);
+    expect(h.browser.find(m => m.type === 'event' && m.event.kind === 'error')).toMatchObject({ event: { phase: 'output', responseId: 'r1' } });
+    h.engine.close();
   });
   it('fails closed on missing live output transcripts', async () => {
     const h = harness(); h.user(); await vi.advanceTimersByTimeAsync(0); h.respond();

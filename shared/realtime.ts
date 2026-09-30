@@ -12,6 +12,8 @@ const item = z.object({
 });
 const response = z.object({
   id, status: z.string(),
+  status_details: z.object({ reason: z.string().transform(value =>
+    ['max_output_tokens', 'content_filter', 'turn_detected', 'client_cancelled'].includes(value) ? value : 'unknown').optional() }).nullable().optional(),
   metadata: z.record(z.string()).nullable().optional(),
   output: z.array(item).optional(),
 });

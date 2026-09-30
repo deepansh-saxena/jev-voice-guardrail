@@ -11,6 +11,7 @@ interface HeldAudio {
 export interface GatedPlayerCallbacks {
   started: (identity: AudioIdentity) => void;
   ended: (identity: AudioIdentity) => void;
+  cancelled?: (identity: AudioIdentity) => void;
   energy: (identity: AudioIdentity, heldMs: number) => void;
 }
 export class GatedPlayer {
@@ -94,6 +95,7 @@ export class GatedPlayer {
       held.source.disconnect();
     }
     held?.buffer.discard();
+    if (held) this.callbacks.cancelled?.(held.identity);
   }
   dispose() {
     this.cancel();

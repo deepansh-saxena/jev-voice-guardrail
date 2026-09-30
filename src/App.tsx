@@ -3,6 +3,7 @@ import { Activity, ArrowDownToLine, ArrowRight, AudioLines, BookOpen, Check, Che
 import { cases } from '../shared/cases';
 import { CHECK_INTERVAL_MS, KB_VERSION, knowledge, phasePolicies, policies, POLICY_VERSION, type AgentMode } from '../shared/policies';
 import { distribution } from '../shared/metrics';
+import { advanceConversation, emptyConversation } from './conversation';
 import { transportFor, type LabEvent, type OutputMode, type Provider, type Readiness } from '../shared/protocol';
 import type { EvalResult } from '../server/evaluation';
 import { examples } from '../shared/policies';
@@ -11,7 +12,7 @@ import { JudgeCost, PricingSettings } from './judge-cost';
 import { LiveCall } from './live';
 import { GatedLiveCall } from './gated-live';
 import { cadenceDescription, defaultSessionSettings, sessionSettingsSchema, type SessionSettings } from '../shared/session-settings';
-import { appendHistory, emptyHistory, incidentCounts, incidentDetail, incidentLabel, inputCheckFor, inputTextFor, outputPauseFor, outputPauseLabel, policyNames, timelineLabel } from './guardrail-history';
+import { appendHistory, emptyHistory, failureLabel, incidentCounts, incidentDetail, incidentLabel, inputCheckFor, inputFailureFor, inputTextFor, outputPauseFor, outputPauseLabel, policyNames, timelineLabel } from './guardrail-history';
 
 const ms = (n: number | null | undefined) => n == null ? '--' : `${Math.round(n)} ms`;
 const providerName = (p: string) => p === 'jev' ? 'Jev' : p === 'llm' ? 'LLM judge' : 'Unknown judge';
@@ -44,6 +45,7 @@ export default function App() {
   const [example, setExample] = useState('roadmap');
   const [ready, setReady] = useState<Readiness>();
   const [events, setEvents] = useState<LabEvent[]>([]);
+  const [conversation, setConversation] = useState(emptyConversation);
   const [history, setHistory] = useState(emptyHistory);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState('Ready to explore');
@@ -56,11 +58,12 @@ export default function App() {
   const evalAbort = useRef<AbortController | undefined>(undefined);
   const eventEnd = useRef<HTMLDivElement>(null);
   const emit = (event: LabEvent) => {
+    setConversation(previous => advanceConversation(previous, event));
     setEvents(previous => [...previous.slice(-599), event]);
     setHistory(previous => appendHistory(previous, event));
     if (event.usage) setUsage(previous => retainUsage(previous, event.usage!));
   };
-  const resetSession = () => { setEvents([]); setHistory(emptyHistory()); setError(undefined); setUsage({}); };
+  const resetSession = () => { setConversation(emptyConversation()); setEvents([]); setHistory(emptyHistory()); setError(undefined); setUsage({}); };
   const updateSettings = (change: Partial<SessionSettings>) => { setSettings(previous => ({ ...previous, ...change })); resetSession(); };
   const settingsValid = sessionSettingsSchema.safeParse(settings).success;
   useEffect(() => {
@@ -82,10 +85,9 @@ export default function App() {
   const busy = active || evaluating;
   const liveReady = ready?.azure.configured && ready[provider].configured;
   const missingLive = ready ? [...ready.azure.missing, ...ready[provider].missing] : [];
-  const transcripts = new Map<string, LabEvent>();
-  events.filter(e => e.kind === 'transcript').forEach(e => transcripts.set(e.responseId ?? `user-${e.turn}`, e));
+  const transcripts = new Map(Object.entries(conversation.messages));
   const checks = events.filter(e => e.kind === 'check-end');
-  const inputCheck = checks.findLast(e => e.phase === 'input');
+  const inputCheck = events.findLast(e => e.phase === 'input' && ['check-start', 'check-end', 'error'].includes(e.kind));
   const outputCheck = checks.findLast(e => e.phase === 'output');
   const inputMetrics = distribution(checks.filter(e => e.phase === 'input').flatMap(e => e.verdict?.serviceMs == null ? [] : [e.verdict.serviceMs]));
   const outputMetrics = distribution(checks.filter(e => e.phase === 'output').flatMap(e => e.verdict?.serviceMs == null ? [] : [e.verdict.serviceMs]));
@@ -187,7 +189,7 @@ export default function App() {
           <section className={`card incident-panel ${history.incidents.length ? 'has-incidents' : ''}`} aria-label="Guardrail incident history" aria-live="polite">
             <div className="section-header"><h2><ShieldCheck size={17} />Guardrail activity</h2><Badge tone={history.incidents.length ? 'red' : 'neutral'}>{'Current session history'}</Badge></div>
             <p className="incident-summary">{counts.inputBlocks} input blocked turns · {counts.gatedOutputBlocks} output blocked before playback · {counts.outputInterruptions} {'confirmed'} streaming interruptions · {counts.outputViolations} output violation responses</p>
-            {outputMode === 'gated' && latestDelivery && <div className={`gate-delivery ${latestDelivery.delivery}`} role="status"><strong>{''}{latestDelivery.delivery === 'held' ? 'OUTPUT HELD / CHECKING' : latestDelivery.delivery === 'approved' ? 'OUTPUT APPROVED' : latestDelivery.delivery === 'playing' ? 'APPROVED OUTPUT PLAYING' : latestDelivery.delivery === 'ended' ? 'LOCAL PLAYBACK ENDED' : 'HELD OUTPUT DISCARDED'}</strong><p>{latestDelivery.name}</p></div>}
+            {outputMode === 'gated' && latestDelivery && latestDelivery.turn === events.findLast(e => e.role === 'user')?.turn && <div className={`gate-delivery ${latestDelivery.delivery}`} role="status"><strong>{latestDelivery.delivery === 'held' ? 'OUTPUT HELD / CHECKING' : latestDelivery.delivery === 'approved' ? 'OUTPUT APPROVED' : latestDelivery.delivery === 'playing' ? 'APPROVED OUTPUT PLAYING' : latestDelivery.delivery === 'ended' ? 'LOCAL PLAYBACK ENDED' : 'HELD OUTPUT DISCARDED'}</strong><p>{latestDelivery.name}</p></div>}
             {!history.incidents.length && <p className="incident-empty">No policy violations recorded. Clarifications, user barge-in and technical errors are not policy violations.</p>}
             {!!history.incidents.length && <ol className="incident-list">{[...history.incidents].reverse().map(incident => {
               const input = inputTextFor(history, incident.first);
@@ -199,7 +201,7 @@ export default function App() {
               </li>;
             })}</ol>}
             {!!clarifications.length && <div className="clarification-history" aria-label="Input clarification history">{[...clarifications].reverse().map(event => <div key={event.id} className="clarification-notice"><strong>{''}NEEDS CLARIFICATION</strong><span>Turn {event.turn ?? '--'} · {inputTextFor(history, event) ?? 'Input transcript unavailable'} · {providerName(event.verdict?.provider ?? '')} · {ms(event.verdict?.serviceMs)}</span><p>Uncertain input, not a confirmed policy violation. A clarification may follow.</p></div>)}</div>}
-            {history.latestError && <div className="unavailable-notice"><strong>GUARDRAIL UNAVAILABLE</strong><p>{history.latestError.name}</p><small>Technical/session failure; not counted as a policy violation.</small></div>}
+            {history.latestError && <div className="unavailable-notice" role="status"><strong>{history.latestError.failure?.filter ? 'PROVIDER FILTER REJECTED CHECK' : 'GUARDRAIL UNAVAILABLE'}</strong><p>{history.latestError.name}</p><small>Turn {history.latestError.turn ?? '--'}{history.latestError.failure ? ` · ${providerName(history.latestError.failure.provider)} · ${history.latestError.failure.phase} · ${history.latestError.failure.providerCode ?? history.latestError.failure.code}` : ''}. {history.latestError.recoverable ? 'That input was not evaluated; no answer was authorized. The session can accept a new question.' : 'Session stopped; resolve the error, then start a new call.'} Not counted as a policy violation.</small></div>}
             <p className="incident-foot">Safe redirects and later passes do not erase this history. It resets when a new session starts or the source changes.</p>
           </section>
           <div className="lab-grid">
@@ -211,22 +213,24 @@ export default function App() {
                   <button className={`primary-button ${active ? 'stop-button' : ''}`} disabled={!active && (!settingsValid || evaluating || (!liveReady))} onClick={active ? stop : start}>{active ? <Square size={15} fill="currentColor" /> : <Mic size={17} />}{active ? 'Stop session' : 'Start microphone'}</button></div>
               </section>
 
-              <section className="card conversation"><div className="section-header"><h2><AudioLines size={17} />Conversation</h2><Badge>{'Generated transcript'}</Badge></div>
+              <section className="card conversation"><div className="section-header"><h2><AudioLines size={17} />Conversation</h2><Badge>{'Playback transcript'}</Badge></div>
                 <div className="messages" aria-live="polite">
                   {!transcripts.size ? <div className="empty-conversation"><div className="empty-icon"><Mic size={23} /></div><strong>A little conversation. A lot of visibility.</strong><p>Pick an example below, then {'start your microphone'}.</p></div> : [...transcripts.values()].map(event => {
                     const checked = event.role === 'user' ? inputCheckFor(history, event) : undefined;
+                    const failed = event.role === 'user' ? inputFailureFor(history, event) : undefined;
                     const audioPause = event.role === 'assistant' ? outputPauseFor(history, event) : undefined;
                     const decision = checked?.verdict?.decision;
                     const flagged = checked?.verdict?.policies.filter(p => p.decision === decision && p.decision !== 'allow').map(p => p.policy) ?? [];
                     return <div className={`message ${event.role}`} key={event.id}>
-                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : 'Monitored · not audio-aligned'}</span></div><p>{event.text}</p>
+                    <span className="message-avatar">{event.role === 'user' ? 'Y' : <AudioLines size={15} />}</span><div><div className="message-label">{event.role === 'user' ? 'You' : 'Relay assistant'}<span>{event.role === 'user' ? 'Transcribed input' : 'Shown during playback'}</span></div><p>{event.text || (audioPause ? 'Response withheld.' : 'Waiting for audio…')}</p>
                       {decision && <div className="message-guardrail"><Badge tone={decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'green'}>{''}{decision === 'violate' ? 'INPUT BLOCKED' : decision === 'uncertain' ? 'NEEDS CLARIFICATION' : 'INPUT ALLOWED'}{flagged.length ? `: ${policyNames(flagged)}` : ''}</Badge>{decision === 'violate' && <small>Original answer blocked before generation.</small>}</div>}
+                      {failed && <div className="message-guardrail"><Badge tone="amber">{failureLabel(failed)}</Badge><small>{failed.name}</small></div>}
                       {audioPause && <div className="message-guardrail"><Badge tone={audioPause.verdict?.decision === 'violate' ? 'red' : 'amber'}>{''}{outputPauseLabel(audioPause)}</Badge><small>Generated text is not proof of heard audio. A separate recovery may follow.</small></div>}
                     </div></div>;
                   })}
                   <div ref={eventEnd} />
                 </div>
-                <div className="conversation-foot"><CircleHelp size={13} />Assistant text can include generated words that were never heard.</div>
+                <div className="conversation-foot"><CircleHelp size={13} />Assistant text appears when browser audio starts. Word timing is approximate.</div>
               </section>
               <section className="examples"><div className="section-header"><h2>Try a conversation</h2><span>Authored scenarios</span></div><div className="example-grid">{examples.map(item => <button key={item.id} disabled={busy} className={`example ${example === item.id ? 'picked' : ''}`} onClick={() => setExample(item.id)}><span>{item.category}<ArrowRight size={13} /></span><strong>{item.title}</strong><p>“{item.text}”</p></button>)}</div>{<p className="muted-note">Examples are speaking prompts; selecting one does not inject text or trigger a response.</p>}</section>
             </div>
@@ -235,7 +239,7 @@ export default function App() {
                 {(['input', 'output'] as const).map(phase => <div className="policy-group" key={phase}><div className="group-heading"><span className={`direction ${phase}`}>{phase === 'input' ? 'IN' : 'OUT'}</span><div><strong>{phase === 'input' ? 'Before the response' : outputMode === 'gated' ? 'Before local playback' : 'While audio plays'}</strong><small>{phase === 'input' ? 'Allow, redirect or clarify' : cadenceDescription(settings)}</small></div></div>
                   {phasePolicies(phase).map(policy => {
                     const decision = (phase === 'input' ? inputCheck : outputCheck)?.verdict?.policies.find(p => p.policy === policy.id)?.decision;
-                    return <div className="policy-row" key={policy.id}><span>{policy.name}</span><Badge tone={decision === 'allow' ? 'green' : decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'neutral'}>{decision === 'allow' ? <Check size={11} /> : decision === 'violate' ? <Square size={8} fill="currentColor" /> : null}{decision === 'allow' && phase === 'output' ? 'Clear so far' : decision ?? 'Waiting'}</Badge></div>;
+                    return <div className="policy-row" key={policy.id}><span>{policy.name}</span><Badge tone={decision === 'allow' ? 'green' : decision === 'violate' ? 'red' : decision === 'uncertain' ? 'amber' : 'neutral'}>{decision === 'allow' ? <Check size={11} /> : decision === 'violate' ? <Square size={8} fill="currentColor" /> : null}{decision === 'allow' && phase === 'output' ? 'Clear so far' : decision ?? (phase === 'input' && inputCheck?.kind === 'error' ? 'Not evaluated' : phase === 'input' && inputCheck?.kind === 'check-start' ? 'Checking' : 'Waiting')}</Badge></div>;
                   })}</div>)}
                 <div className="policy-foot"><LockKeyhole size={13} />Latest verdicts only. Earlier triggers stay in Guardrail activity.</div>
               </section>

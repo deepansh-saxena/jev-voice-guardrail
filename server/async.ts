@@ -1,11 +1,14 @@
+import type { JudgeFailure } from '../shared/protocol';
+
 export class GuardrailError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); }
+  constructor(public readonly code: string, message: string, public readonly failure?: JudgeFailure) { super(message); }
 }
 
 export async function bounded<T>(
   work: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   parent?: AbortSignal,
+  operation = 'Guardrail unavailable',
 ): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -21,7 +24,7 @@ export async function bounded<T>(
         if (parent?.aborted) abortListener();
         timer = setTimeout(() => {
           controller.abort();
-          reject(new GuardrailError('timeout', `Guardrail unavailable: timed out after ${timeoutMs} ms.`));
+          reject(new GuardrailError('timeout', `${operation}: timed out after ${timeoutMs} ms.`));
         }, timeoutMs);
       }),
       Promise.resolve().then(() => {

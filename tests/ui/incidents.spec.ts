@@ -86,6 +86,30 @@ test.beforeEach(async ({ page }) => {
     expect(rejected.status()).toBe(400);
   });
 
+test('provider-filtered input stays visibly unevaluated while the next turn remains available', async ({ page }) => {
+  await page.getByRole('button', { name: 'Start microphone' }).click();
+  await deliver(page, [
+    event({ kind: 'transcript', role: 'user', phase: 'input', turn: 1, text: 'First benign question' }),
+    verdict('input', [], { turn: 1 }),
+    event({ kind: 'transcript', role: 'user', phase: 'input', turn: 2, text: 'Rejected synthetic question' }),
+    event({ kind: 'error', phase: 'input', turn: 2, recoverable: true, name: 'LLM judge provider content filter rejected this input check. No Relay policy verdict was returned.',
+      failure: { provider: 'llm', phase: 'input', code: 'http-400', httpStatus: 400, providerCode: 'content_filter', filter: 'jailbreak' } }),
+    event({ kind: 'status', name: 'Input not evaluated; listening for a new question', turn: 2 }),
+  ]);
+  await expect(page.getByRole('button', { name: 'Stop session' })).toBeEnabled();
+  await expect(page.locator('.message.user').filter({ hasText: 'Rejected synthetic question' })).toContainText('PROVIDER FILTERED - NOT A POLICY VERDICT');
+  await expect(page.locator('.policy-panel').getByText('Not evaluated', { exact: true })).toHaveCount(3);
+  await expect(page.locator('.unavailable-notice')).toContainText('Turn 2 · LLM judge · input · content_filter');
+  await expect(page.locator('.unavailable-notice')).toContainText('session can accept a new question');
+  await expect(page.locator('[aria-label="Input blocked turns"] strong')).toHaveText('0');
+  await deliver(page, [
+    event({ kind: 'transcript', role: 'user', phase: 'input', turn: 3, text: 'New Relay question' }),
+    verdict('input', [], { turn: 3 }),
+  ]);
+  await expect(page.locator('.message.user').filter({ hasText: 'New Relay question' })).toContainText('INPUT ALLOWED');
+  await expect(page.locator('.message.user').filter({ hasText: 'Rejected synthetic question' })).toContainText('PROVIDER FILTERED');
+});
+
 test('two input blocks stay prominent with actual message associations and counts after safe redirects', async ({ page }) => {
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await deliver(page, [
