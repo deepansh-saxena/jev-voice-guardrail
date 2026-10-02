@@ -5,6 +5,55 @@ React/TypeScript/Vite frontend, Node/TypeScript backend, native Azure OpenAI
 Realtime speech-to-speech, TypeSafe Jev and a separately configured structured-output LLM judge.
 There is no simulated session mode or production mock judge.
 
+## Can we guardrail voice without breaking the conversation?
+
+[Watch the demo: LLM judge vs. Jev (MP4)](docs/media/voice-guardrail-demo.mp4)
+
+The video compares latency in this demo system with guardrailing implemented
+using an LLM judge versus TypeSafe AI's Jev, with the same voice model, policies,
+and delivery settings.
+
+[LiveKit's background observer guide](https://livekit.com/blog/observer-pattern-voice-agent-guardrails)
+describes a separate LLM evaluating user turns without blocking the conversation,
+then injecting guidance for subsequent responses.
+[OpenAI's Realtime Agents SDK](https://openai.github.io/openai-agents-js/guides/voice-agents/build/#guardrails)
+supports asynchronous output checks that can interrupt a response when a guardrail
+trips.
+
+These approaches let the conversation keep moving while checks run. But checking
+alongside speech leaves a timing risk: restricted information may reach the
+customer before the check finishes. A voice agent cannot take that back.
+
+Gated guardrails hold the audio until the response is approved. The challenge is
+making that approval fast enough to preserve the flow of conversation. This lab
+uses Azure OpenAI Realtime to compare an LLM-based judge with
+[TypeSafe AI's Jev](https://docs.typesafe.ai/models).
+
+### Findings from the demo
+
+Observed service latency per check, as reported from the demo:
+
+- **LLM judge: approximately 750–800 ms.**
+- **Jev: approximately 150–200 ms.**
+
+For one input check before generation and one output check before playback,
+summing those observed ranges gives approximately **1.5–1.6 seconds of judging
+with the LLM**, versus **300–400 ms with Jev**. That is roughly **4–5× faster
+checks**, saving about **1.2 seconds per turn from judging alone** in this
+illustrative two-check comparison.
+
+Voice generation and full-response buffering still add their own wait. These
+figures are demo observations, not a controlled benchmark or an end-to-end
+latency guarantee. Check durations include HTTP round trips. Periodic and
+pause-based output checking can issue multiple checks and overlap generation;
+the two-check sum is not a measured total turn latency for every mode.
+
+The opportunity this project explores is making checks **before speech** fast
+enough to keep the conversation flowing, while retaining explicit approval
+before gated audio playback.
+
+Code: [deepansh-saxena/jev-voice-guardrail](https://github.com/deepansh-saxena/jev-voice-guardrail).
+
 ## Run locally
 
 Node 20.19+ is required.

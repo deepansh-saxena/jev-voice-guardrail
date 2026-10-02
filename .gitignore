@@ -43,3 +43,6 @@ session-state/
 *.tsbuildinfo
 *.log
 .DS_Store
+
+# Published demo explicitly included; other recordings remain private.
+!docs/media/voice-guardrail-demo.mp4
