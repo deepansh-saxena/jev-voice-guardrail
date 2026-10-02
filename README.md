@@ -1,11 +1,11 @@
-https://github.com/user-attachments/assets/dfd2bfcb-26be-4ffe-81c2-b93712a78305
-
 # Relay Guardrail Lab
 
 A real-provider voice guardrail lab for fictional Relay subscription support.
 React/TypeScript/Vite frontend, Node/TypeScript backend, native Azure OpenAI
 Realtime speech-to-speech, TypeSafe Jev and a separately configured structured-output LLM judge.
 There is no simulated session mode or production mock judge.
+
+https://github.com/user-attachments/assets/dfd2bfcb-26be-4ffe-81c2-b93712a78305
 
 ## Can we guardrail voice without breaking the conversation?
 
