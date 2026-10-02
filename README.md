@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/dfd2bfcb-26be-4ffe-81c2-b93712a78305
+
 # Relay Guardrail Lab
 
 A real-provider voice guardrail lab for fictional Relay subscription support.
@@ -6,8 +8,6 @@ Realtime speech-to-speech, TypeSafe Jev and a separately configured structured-o
 There is no simulated session mode or production mock judge.
 
 ## Can we guardrail voice without breaking the conversation?
-
-[Watch the demo: LLM judge vs. Jev (MP4)](docs/media/voice-guardrail-demo.mp4)
 
 The video compares latency in this demo system with guardrailing implemented
 using an LLM judge versus TypeSafe AI's Jev, with the same voice model, policies,
